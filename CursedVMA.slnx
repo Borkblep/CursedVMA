@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="CursedVMA.Tests/CursedVMA.Tests.csproj" />
+  <Project Path="CursedVMA/CursedVMA.csproj" />
+</Solution>

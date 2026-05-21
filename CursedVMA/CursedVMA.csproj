@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>CursedVMA</RootNamespace>
+    <AssemblyName>CursedVMA</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Silk.NET.Vulkan" Version="2.22.0" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.22.0" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.22.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CursedVMA.Tests" />
+  </ItemGroup>
+
+</Project>

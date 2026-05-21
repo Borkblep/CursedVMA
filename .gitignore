@@ -1,0 +1,56 @@
+## Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+
+## NativeAOT / publish artifacts
+publish/
+*.pdb
+
+## User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+## Test results / coverage
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.coveragexml
+
+## NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+*.nuget.props
+*.nuget.targets
+.nuget/
+
+## OS metadata
+.DS_Store
+Thumbs.db

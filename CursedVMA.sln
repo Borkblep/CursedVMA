@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CursedVMA", "CursedVMA\CursedVMA.csproj", "{31098787-7338-491F-8CF4-701F06CD01C8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CursedVMA.Tests", "CursedVMA.Tests\CursedVMA.Tests.csproj", "{90CFCE3B-E659-4497-8889-1AB9CE4E67AE}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{31098787-7338-491F-8CF4-701F06CD01C8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{31098787-7338-491F-8CF4-701F06CD01C8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{31098787-7338-491F-8CF4-701F06CD01C8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{31098787-7338-491F-8CF4-701F06CD01C8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{90CFCE3B-E659-4497-8889-1AB9CE4E67AE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{90CFCE3B-E659-4497-8889-1AB9CE4E67AE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{90CFCE3B-E659-4497-8889-1AB9CE4E67AE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{90CFCE3B-E659-4497-8889-1AB9CE4E67AE}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

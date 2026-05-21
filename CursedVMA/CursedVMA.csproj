@@ -16,8 +16,4 @@
     <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.22.0" />
   </ItemGroup>
 
-  <ItemGroup>
-    <InternalsVisibleTo Include="CursedVMA.Tests" />
-  </ItemGroup>
-
 </Project>

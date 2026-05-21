@@ -210,8 +210,9 @@ namespace CursedVMA.Tests
     public sealed class VmaMathBufferImageGranularityConflictTests
     {
         // The conflict table from VMA's IsBufferImageGranularityConflict. Parameters are
-        // bytes (rather than the internal VmaSuballocationType enum) so the test class can
-        // remain public — xUnit's analyzers require that.
+        // bytes (rather than the internal VmaSuballocationType enum) because xUnit requires
+        // test classes to be public and a public method cannot declare an internal
+        // parameter type (C# CS0051) — independent of InternalsVisibleTo.
         [Theory]
         [InlineData(/*Free*/         0, /*Buffer*/         2, false)]
         [InlineData(/*Free*/         0, /*ImageOptimal*/   5, false)]

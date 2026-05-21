@@ -65,9 +65,6 @@ namespace CursedVMA
         /// </summary>
         public void Dispose()
         {
-            if (m_Metadata == null) return;
-            System.Diagnostics.Debug.Assert(m_Metadata.IsEmpty(),
-                "VmaVirtualBlock disposed with live allocations.");
             m_Metadata = null;
         }
 

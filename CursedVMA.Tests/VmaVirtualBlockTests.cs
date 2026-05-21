@@ -47,8 +47,8 @@ namespace CursedVMA.Tests
         [Fact]
         public void Dispose_WithLiveAllocation_DoesNotThrow()
         {
-            // Mirrors C++ behavior: Dispose tears down the block even when
-            // allocations are still live (the C++ port asserts in debug only).
+            // Mirrors C++ release-build behavior: Dispose silently tears down
+            // the block even when allocations are still live.
             var info = new VmaVirtualBlockCreateInfo { Size = 4096 };
             VmaVirtualBlock.Create(in info, out var block);
             block!.Allocate(

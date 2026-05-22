@@ -2,6 +2,8 @@
 // Phase 8: CreatePool / DestroyPool. Phase 9: per-allocation API
 // (AllocateMemory, FreeMemory, Map/Unmap, Bind*). Phase 10: dedicated
 // allocations triggered by VmaAllocationCreateFlags.DedicatedMemoryBit.
+// Phase 11: allocator-wide statistics (GetStatistics, CalculateStatistics)
+// and heap budgets (GetHeapBudgets).
 
 using CursedVMA.Internal;
 using Silk.NET.Vulkan;
@@ -515,6 +517,133 @@ namespace CursedVMA
                 VkFunctions, Device, allocationLocalOffset, image, pNext);
         }
 
+        // ── Phase 11: allocator-wide statistics and heap budgets ─────────────
+
+        /// <summary>
+        /// Fills per-memory-type lightweight statistics across all block
+        /// vectors, custom pools, and dedicated allocations. Equivalent to
+        /// <c>vmaGetStatistics</c>. <paramref name="outStats"/> should have at
+        /// least <see cref="MemoryTypeCount"/> entries; extra entries are
+        /// zeroed.
+        /// </summary>
+        public void GetStatistics(Span<VmaStatistics> outStats)
+        {
+            RequireNotDisposed();
+            outStats.Clear();
+
+            uint count = Math.Min((uint)outStats.Length, MemoryTypeCount);
+            for (uint i = 0; i < count; i++)
+                m_pBlockVectors[i]?.AddStatistics(ref outStats[(int)i]);
+
+            lock (m_PoolsMutex)
+            {
+                foreach (var pool in m_Pools)
+                {
+                    uint typeIndex = pool.BlockVector.MemoryTypeIndex;
+                    if (typeIndex < count)
+                        pool.BlockVector.AddStatistics(ref outStats[(int)typeIndex]);
+                }
+            }
+
+            lock (m_DedicatedMutex)
+            {
+                foreach (var alloc in m_DedicatedAllocations)
+                {
+                    uint typeIndex = alloc.MemoryTypeIndex;
+                    if (typeIndex < count)
+                    {
+                        outStats[(int)typeIndex].BlockCount++;
+                        outStats[(int)typeIndex].BlockBytes      += alloc.Size;
+                        outStats[(int)typeIndex].AllocationCount++;
+                        outStats[(int)typeIndex].AllocationBytes += alloc.Size;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Fills <paramref name="stats"/> with detailed statistics broken down
+        /// by memory type, memory heap, and the allocator total. Equivalent to
+        /// <c>vmaCalculateStatistics</c>.
+        /// </summary>
+        public void CalculateStatistics(out VmaTotalStatistics stats)
+        {
+            RequireNotDisposed();
+            stats = default;
+
+            for (uint typeIndex = 0; typeIndex < MemoryTypeCount; typeIndex++)
+            {
+                VmaDetailedStatistics typeStats = default;
+
+                m_pBlockVectors[typeIndex]?.AddDetailedStatistics(ref typeStats);
+
+                lock (m_PoolsMutex)
+                {
+                    foreach (var pool in m_Pools)
+                        if (pool.BlockVector.MemoryTypeIndex == typeIndex)
+                            pool.BlockVector.AddDetailedStatistics(ref typeStats);
+                }
+
+                lock (m_DedicatedMutex)
+                {
+                    foreach (var alloc in m_DedicatedAllocations)
+                    {
+                        if (alloc.MemoryTypeIndex == typeIndex)
+                        {
+                            typeStats.Statistics.BlockCount++;
+                            typeStats.Statistics.BlockBytes += alloc.Size;
+                            VmaStatisticsHelper.AddDetailedStatisticsAllocation(ref typeStats, alloc.Size);
+                        }
+                    }
+                }
+
+                uint heapIndex = GetMemoryType(typeIndex).HeapIndex;
+                VmaStatisticsHelper.MergeDetailedStatistics(
+                    ref stats.MemoryType[(int)typeIndex], in typeStats);
+                VmaStatisticsHelper.MergeDetailedStatistics(
+                    ref stats.MemoryHeap[(int)heapIndex], in typeStats);
+                VmaStatisticsHelper.MergeDetailedStatistics(ref stats.Total, in typeStats);
+            }
+        }
+
+        /// <summary>
+        /// Fills per-heap budget information. Statistics are aggregated across
+        /// all memory types that belong to each heap. Without
+        /// <c>VK_EXT_memory_budget</c> the budget is estimated as 80% of the
+        /// heap size and the usage equals the currently allocated block bytes.
+        /// Equivalent to <c>vmaGetHeapBudgets</c>.
+        /// <paramref name="outBudgets"/> should have at least
+        /// <see cref="MemoryHeapCount"/> entries; extra entries are zeroed.
+        /// </summary>
+        public void GetHeapBudgets(Span<VmaBudget> outBudgets)
+        {
+            RequireNotDisposed();
+            outBudgets.Clear();
+
+            Span<VmaStatistics> typeStats = stackalloc VmaStatistics[(int)MemoryTypeCount];
+            GetStatistics(typeStats);
+
+            uint heapCount = Math.Min((uint)outBudgets.Length, MemoryProperties.MemoryHeapCount);
+            for (uint heapIndex = 0; heapIndex < heapCount; heapIndex++)
+            {
+                outBudgets[(int)heapIndex] = default;
+
+                for (uint typeIndex = 0; typeIndex < MemoryTypeCount; typeIndex++)
+                {
+                    if (GetMemoryType(typeIndex).HeapIndex == heapIndex)
+                    {
+                        VmaStatisticsHelper.MergeStatistics(
+                            ref outBudgets[(int)heapIndex].Statistics,
+                            in typeStats[(int)typeIndex]);
+                    }
+                }
+
+                ulong heapSize = GetMemoryHeap(heapIndex).Size;
+                outBudgets[(int)heapIndex].Usage   = outBudgets[(int)heapIndex].Statistics.BlockBytes;
+                outBudgets[(int)heapIndex].Budget  = heapSize * 8 / 10;
+            }
+        }
+
         // ── Tears down all default block vectors ──────────────────────────────
 
         /// <summary>
@@ -552,6 +681,7 @@ namespace CursedVMA
         // --- Internal accessors ---
 
         internal uint MemoryTypeCount => MemoryProperties.MemoryTypeCount;
+        internal uint MemoryHeapCount => MemoryProperties.MemoryHeapCount;
 
         internal MemoryType GetMemoryType(uint index)
             => MemoryProperties.MemoryTypes[(int)index];

@@ -3,12 +3,16 @@
 // (AllocateMemory, FreeMemory, Map/Unmap, Bind*). Phase 10: dedicated
 // allocations triggered by VmaAllocationCreateFlags.DedicatedMemoryBit.
 // Phase 11: allocator-wide statistics (GetStatistics, CalculateStatistics)
-// and heap budgets (GetHeapBudgets).
+// and heap budgets (GetHeapBudgets). Phase 12: GetAllocatorInfo and JSON
+// statistics dump (BuildStatsString).
 
 using CursedVMA.Internal;
 using Silk.NET.Vulkan;
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
 
 namespace CursedVMA
 {
@@ -25,6 +29,7 @@ namespace CursedVMA
         private const ulong SmallHeapMaxSize = 1024ul * 1024 * 1024;
 
         internal IVulkanFunctions VkFunctions { get; }
+        internal Instance Instance { get; }
         internal PhysicalDevice PhysicalDevice { get; }
         internal Device Device { get; }
         internal AllocationCallbacks? AllocatorCallbacks { get; }
@@ -53,6 +58,7 @@ namespace CursedVMA
         private VmaAllocator(
             IVulkanFunctions vkFunctions,
             VmaAllocatorCreateFlags flags,
+            Instance instance,
             PhysicalDevice physicalDevice,
             Device device,
             AllocationCallbacks? allocatorCallbacks,
@@ -63,6 +69,7 @@ namespace CursedVMA
         {
             VkFunctions = vkFunctions;
             Flags = flags;
+            Instance = instance;
             PhysicalDevice = physicalDevice;
             Device = device;
             AllocatorCallbacks = allocatorCallbacks;
@@ -131,6 +138,7 @@ namespace CursedVMA
             var inst = new VmaAllocator(
                 vkFunctions,
                 createInfo.Flags,
+                createInfo.Instance,
                 createInfo.PhysicalDevice,
                 createInfo.Device,
                 createInfo.AllocationCallbacks,
@@ -642,6 +650,252 @@ namespace CursedVMA
                 outBudgets[(int)heapIndex].Usage   = outBudgets[(int)heapIndex].Statistics.BlockBytes;
                 outBudgets[(int)heapIndex].Budget  = heapSize * 8 / 10;
             }
+        }
+
+        // ── Phase 12: allocator info + JSON statistics dump ──────────────────
+
+        /// <summary>
+        /// Returns a snapshot of the Vulkan handles this allocator was created
+        /// with. Equivalent to <c>vmaGetAllocatorInfo</c>.
+        /// </summary>
+        public void GetAllocatorInfo(out VmaAllocatorInfo info)
+        {
+            RequireNotDisposed();
+            info = new VmaAllocatorInfo
+            {
+                Instance       = Instance,
+                PhysicalDevice = PhysicalDevice,
+                Device         = Device,
+            };
+        }
+
+        /// <summary>
+        /// Builds a JSON string describing the allocator's state — general
+        /// device info, total statistics, per-heap and per-type breakdown, and
+        /// custom pools. When <paramref name="detailedMap"/> is true the output
+        /// also lists per-block suballocation offsets and sizes. Equivalent to
+        /// <c>vmaBuildStatsString</c> (no separate free call needed — the
+        /// returned string is GC-managed).
+        /// </summary>
+        public string BuildStatsString(bool detailedMap)
+        {
+            RequireNotDisposed();
+
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream,
+                new JsonWriterOptions { Indented = true }))
+            {
+                writer.WriteStartObject();
+
+                WriteGeneralSection(writer);
+
+                CalculateStatistics(out var total);
+                writer.WritePropertyName("Total");
+                WriteDetailedStatistics(writer, in total.Total);
+
+                WriteMemoryHeapsSection(writer, in total);
+                WriteMemoryTypesSection(writer, in total, detailedMap);
+                WritePoolsSection(writer, detailedMap);
+
+                writer.WriteEndObject();
+            }
+
+            return Encoding.UTF8.GetString(stream.ToArray());
+        }
+
+        private void WriteGeneralSection(Utf8JsonWriter writer)
+        {
+            writer.WritePropertyName("General");
+            writer.WriteStartObject();
+            writer.WriteString("API", "Vulkan");
+            writer.WriteString("apiVersion", FormatApiVersion(VulkanApiVersion));
+            writer.WriteNumber("maxMemoryAllocationCount", DeviceLimits.MaxMemoryAllocationCount);
+            writer.WriteNumber("bufferImageGranularity",   DeviceLimits.BufferImageGranularity);
+            writer.WriteNumber("nonCoherentAtomSize",      DeviceLimits.NonCoherentAtomSize);
+            writer.WriteNumber("memoryHeapCount",          MemoryHeapCount);
+            writer.WriteNumber("memoryTypeCount",          MemoryTypeCount);
+            writer.WriteEndObject();
+        }
+
+        private void WriteMemoryHeapsSection(Utf8JsonWriter writer, in VmaTotalStatistics total)
+        {
+            Span<VmaBudget> budgets = stackalloc VmaBudget[(int)MemoryHeapCount];
+            GetHeapBudgets(budgets);
+
+            writer.WritePropertyName("MemoryHeaps");
+            writer.WriteStartArray();
+            for (uint h = 0; h < MemoryHeapCount; h++)
+            {
+                MemoryHeap heap = GetMemoryHeap(h);
+                writer.WriteStartObject();
+                writer.WriteNumber("Index", h);
+                writer.WriteNumber("Size", heap.Size);
+                writer.WritePropertyName("Flags");
+                WriteMemoryHeapFlags(writer, heap.Flags);
+                writer.WriteNumber("BudgetBytes", budgets[(int)h].Budget);
+                writer.WriteNumber("UsageBytes",  budgets[(int)h].Usage);
+                writer.WritePropertyName("Stats");
+                WriteDetailedStatistics(writer, in total.MemoryHeap[(int)h]);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+        }
+
+        private void WriteMemoryTypesSection(Utf8JsonWriter writer,
+            in VmaTotalStatistics total, bool detailedMap)
+        {
+            writer.WritePropertyName("MemoryTypes");
+            writer.WriteStartArray();
+            for (uint t = 0; t < MemoryTypeCount; t++)
+            {
+                MemoryType mt = GetMemoryType(t);
+                writer.WriteStartObject();
+                writer.WriteNumber("Index", t);
+                writer.WriteNumber("HeapIndex", mt.HeapIndex);
+                writer.WritePropertyName("Flags");
+                WriteMemoryPropertyFlags(writer, mt.PropertyFlags);
+                writer.WritePropertyName("Stats");
+                WriteDetailedStatistics(writer, in total.MemoryType[(int)t]);
+
+                if (detailedMap)
+                {
+                    var bv = m_pBlockVectors[t];
+                    if (bv != null)
+                        WriteBlockArray(writer, bv.GetBlockSnapshot());
+
+                    writer.WritePropertyName("DedicatedAllocations");
+                    writer.WriteStartArray();
+                    lock (m_DedicatedMutex)
+                    {
+                        foreach (var alloc in m_DedicatedAllocations)
+                        {
+                            if (alloc.MemoryTypeIndex != t) continue;
+                            WriteDedicatedAllocation(writer, alloc);
+                        }
+                    }
+                    writer.WriteEndArray();
+                }
+
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+        }
+
+        private void WritePoolsSection(Utf8JsonWriter writer, bool detailedMap)
+        {
+            writer.WritePropertyName("Pools");
+            writer.WriteStartArray();
+            lock (m_PoolsMutex)
+            {
+                foreach (var pool in m_Pools)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteNumber("Id", pool.Id);
+                    if (pool.Name != null)
+                        writer.WriteString("Name", pool.Name);
+                    writer.WriteNumber("MemoryTypeIndex", pool.BlockVector.MemoryTypeIndex);
+                    writer.WriteNumber("BlockSize", pool.BlockVector.PreferredBlockSize);
+
+                    pool.CalculateStatistics(out var poolStats);
+                    writer.WritePropertyName("Stats");
+                    WriteDetailedStatistics(writer, in poolStats);
+
+                    if (detailedMap)
+                        WriteBlockArray(writer, pool.BlockVector.GetBlockSnapshot());
+
+                    writer.WriteEndObject();
+                }
+            }
+            writer.WriteEndArray();
+        }
+
+        private static void WriteBlockArray(Utf8JsonWriter writer, VmaDeviceMemoryBlock[] blocks)
+        {
+            writer.WritePropertyName("Blocks");
+            writer.WriteStartArray();
+            foreach (var block in blocks)
+                WriteBlockDetailed(writer, block);
+            writer.WriteEndArray();
+        }
+
+        private static void WriteBlockDetailed(Utf8JsonWriter writer, VmaDeviceMemoryBlock block)
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("Id", block.Id);
+            writer.WriteNumber("Size", block.Metadata.GetSize());
+            writer.WriteNumber("AllocationCount", (ulong)block.Metadata.GetAllocationCount());
+            writer.WriteNumber("FreeBytes", block.Metadata.GetSumFreeSize());
+            writer.WriteNumber("MapCount", block.MapCount);
+
+            writer.WritePropertyName("Suballocations");
+            writer.WriteStartArray();
+            ulong handle = block.Metadata.GetAllocationListBegin();
+            while (handle != 0)
+            {
+                block.Metadata.GetAllocationInfo(handle, out var info);
+                writer.WriteStartObject();
+                writer.WriteNumber("Offset", info.Offset);
+                writer.WriteNumber("Size", info.Size);
+                writer.WriteEndObject();
+                handle = block.Metadata.GetNextAllocation(handle);
+            }
+            writer.WriteEndArray();
+
+            writer.WriteEndObject();
+        }
+
+        private static void WriteDedicatedAllocation(Utf8JsonWriter writer, VmaAllocation alloc)
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("Size", alloc.Size);
+            if (alloc.Name != null)
+                writer.WriteString("Name", alloc.Name);
+            writer.WriteEndObject();
+        }
+
+        private static void WriteDetailedStatistics(Utf8JsonWriter writer, in VmaDetailedStatistics s)
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("BlockCount",         s.Statistics.BlockCount);
+            writer.WriteNumber("BlockBytes",         s.Statistics.BlockBytes);
+            writer.WriteNumber("AllocationCount",    s.Statistics.AllocationCount);
+            writer.WriteNumber("AllocationBytes",    s.Statistics.AllocationBytes);
+            writer.WriteNumber("UnusedRangeCount",   s.UnusedRangeCount);
+            writer.WriteNumber("AllocationSizeMin",  s.AllocationSizeMin);
+            writer.WriteNumber("AllocationSizeMax",  s.AllocationSizeMax);
+            writer.WriteNumber("UnusedRangeSizeMin", s.UnusedRangeSizeMin);
+            writer.WriteNumber("UnusedRangeSizeMax", s.UnusedRangeSizeMax);
+            writer.WriteEndObject();
+        }
+
+        private static void WriteMemoryPropertyFlags(Utf8JsonWriter writer, MemoryPropertyFlags f)
+        {
+            writer.WriteStartArray();
+            if ((f & MemoryPropertyFlags.DeviceLocalBit)     != 0) writer.WriteStringValue("DeviceLocal");
+            if ((f & MemoryPropertyFlags.HostVisibleBit)     != 0) writer.WriteStringValue("HostVisible");
+            if ((f & MemoryPropertyFlags.HostCoherentBit)    != 0) writer.WriteStringValue("HostCoherent");
+            if ((f & MemoryPropertyFlags.HostCachedBit)      != 0) writer.WriteStringValue("HostCached");
+            if ((f & MemoryPropertyFlags.LazilyAllocatedBit) != 0) writer.WriteStringValue("LazilyAllocated");
+            if ((f & MemoryPropertyFlags.ProtectedBit)       != 0) writer.WriteStringValue("Protected");
+            writer.WriteEndArray();
+        }
+
+        private static void WriteMemoryHeapFlags(Utf8JsonWriter writer, MemoryHeapFlags f)
+        {
+            writer.WriteStartArray();
+            if ((f & MemoryHeapFlags.DeviceLocalBit)   != 0) writer.WriteStringValue("DeviceLocal");
+            if ((f & MemoryHeapFlags.MultiInstanceBit) != 0) writer.WriteStringValue("MultiInstance");
+            writer.WriteEndArray();
+        }
+
+        // VK_MAKE_API_VERSION packs major/minor/patch into a single uint.
+        private static string FormatApiVersion(uint v)
+        {
+            if (v == 0) return "0.0.0";
+            uint major = (v >> 22) & 0x7Fu;
+            uint minor = (v >> 12) & 0x3FFu;
+            uint patch =  v        & 0xFFFu;
+            return $"{major}.{minor}.{patch}";
         }
 
         // ── Tears down all default block vectors ──────────────────────────────

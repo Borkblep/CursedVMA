@@ -61,7 +61,20 @@ namespace CursedVMA.Internal
 
         internal uint MemoryTypeIndex => m_MemoryTypeIndex;
         internal ulong PreferredBlockSize => m_PreferredBlockSize;
+        internal nuint MinBlockCount => m_MinBlockCount;
+        internal nuint MaxBlockCount => m_MaxBlockCount;
+        internal VmaPoolCreateFlags Algorithm => m_Algorithm;
         internal int BlockCount { get { lock (m_MutexLock) return m_Blocks.Count; } }
+
+        /// <summary>
+        /// Returns a snapshot of the current block list. Used by
+        /// <c>VmaAllocator.BuildStatsString</c> for detailed dumps.
+        /// </summary>
+        internal VmaDeviceMemoryBlock[] GetBlockSnapshot()
+        {
+            lock (m_MutexLock)
+                return m_Blocks.ToArray();
+        }
 
         /// <summary>
         /// Pre-allocates <see cref="m_MinBlockCount"/> blocks. Called once after

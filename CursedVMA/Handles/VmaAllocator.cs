@@ -1,12 +1,12 @@
-// Ports VmaAllocator_T from vk_mem_alloc.cpp. Phase 7 implements the full
-// lifecycle: Create (validate params, query device memory properties, build
-// per-memory-type VmaBlockVectors) and Dispose (tear down all block vectors).
-// Actual memory allocation entry-points (AllocateMemory, FreeMemory, …) land
+// Ports VmaAllocator_T from vk_mem_alloc.cpp. Phase 7 implemented the core
+// lifecycle. Phase 8 adds CreatePool / DestroyPool and per-pool tracking.
+// Actual per-allocation entry-points (AllocateMemory, FreeMemory, …) land
 // in Phase 9.
 
 using CursedVMA.Internal;
 using Silk.NET.Vulkan;
 using System;
+using System.Collections.Generic;
 
 namespace CursedVMA
 {
@@ -35,6 +35,11 @@ namespace CursedVMA
         // One default block vector per Vulkan memory type (up to VK_MAX_MEMORY_TYPES).
         private readonly VmaBlockVector?[] m_pBlockVectors =
             new VmaBlockVector[Vk.MaxMemoryTypes];
+
+        // User-created pools tracked for DestroyPool unregistration.
+        private readonly List<VmaPool> m_Pools = new List<VmaPool>();
+        private readonly object m_PoolsMutex = new object();
+        private uint m_NextPoolId;
 
         private bool m_IsDisposed;
 
@@ -159,9 +164,106 @@ namespace CursedVMA
         }
 
         /// <summary>
-        /// Tears down all block vectors and frees their backing
-        /// <c>VkDeviceMemory</c> objects. Equivalent to
-        /// <c>vmaDestroyAllocator</c>. Safe to call more than once.
+        /// Creates a custom memory pool that allocates from a specific memory type
+        /// with caller-specified block size, algorithm, and count constraints.
+        /// Equivalent to <c>vmaCreatePool</c>.
+        /// </summary>
+        /// <param name="createInfo">Pool parameters.</param>
+        /// <param name="pool">On success, the new pool handle.</param>
+        /// <returns><see cref="Result.Success"/> on success;
+        /// <see cref="Result.ErrorInitializationFailed"/> if the memory type
+        /// index is out of range.</returns>
+        public unsafe Result CreatePool(
+            in VmaPoolCreateInfo createInfo,
+            out VmaPool? pool)
+        {
+            RequireNotDisposed();
+            pool = null;
+
+            if (createInfo.MemoryTypeIndex >= MemoryTypeCount)
+                return Result.ErrorInitializationFailed;
+
+            // Determine block size: explicit from caller, or derived from heap.
+            ulong blockSize;
+            bool explicitBlockSize;
+            if (createInfo.BlockSize != 0)
+            {
+                blockSize = createInfo.BlockSize;
+                explicitBlockSize = true;
+            }
+            else
+            {
+                uint heapIndex = GetMemoryType(createInfo.MemoryTypeIndex).HeapIndex;
+                ulong heapSize = GetMemoryHeap(heapIndex).Size;
+                blockSize = CalcPreferredBlockSize(heapSize, PreferredLargeHeapBlockSize);
+                explicitBlockSize = false;
+            }
+
+            // Honor IgnoreBufferImageGranularityBit: set granularity to 1
+            // so the metadata skips buffer-image-granularity alignment padding.
+            ulong bufferImageGranularity =
+                (createInfo.Flags & VmaPoolCreateFlags.IgnoreBufferImageGranularityBit) != 0
+                    ? 1ul
+                    : (DeviceLimits.BufferImageGranularity != 0
+                        ? DeviceLimits.BufferImageGranularity : 1ul);
+
+            nuint maxBlockCount =
+                createInfo.MaxBlockCount == 0 ? nuint.MaxValue : createInfo.MaxBlockCount;
+
+            ulong minAllocationAlignment =
+                createInfo.MinAllocationAlignment != 0 ? createInfo.MinAllocationAlignment : 1;
+
+            var blockVector = new VmaBlockVector(
+                VkFunctions, Device, AllocatorCallbacks,
+                createInfo.MemoryTypeIndex,
+                blockSize,
+                createInfo.MinBlockCount,
+                maxBlockCount,
+                bufferImageGranularity,
+                createInfo.Flags & VmaPoolCreateFlags.AlgorithmMask,
+                explicitBlockSize,
+                minAllocationAlignment,
+                (nint)createInfo.MemoryAllocateNext);
+
+            Result r = blockVector.Init();
+            if (r != Result.Success)
+            {
+                blockVector.Destroy();
+                return r;
+            }
+
+            uint id;
+            lock (m_PoolsMutex)
+                id = m_NextPoolId++;
+
+            var newPool = new VmaPool(blockVector, id);
+
+            lock (m_PoolsMutex)
+                m_Pools.Add(newPool);
+
+            pool = newPool;
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Unregisters a pool from this allocator and releases all of its
+        /// <c>VkDeviceMemory</c> blocks. Equivalent to <c>vmaDestroyPool</c>.
+        /// </summary>
+        public void DestroyPool(VmaPool pool)
+        {
+            RequireNotDisposed();
+
+            lock (m_PoolsMutex)
+                m_Pools.Remove(pool);
+
+            pool.Dispose();
+        }
+
+        /// <summary>
+        /// Tears down all default block vectors. Pools created via
+        /// <see cref="CreatePool"/> are user-owned and must be explicitly
+        /// destroyed with <see cref="DestroyPool"/> before this call.
+        /// Equivalent to <c>vmaDestroyAllocator</c>. Safe to call more than once.
         /// </summary>
         public void Dispose()
         {
@@ -188,6 +290,8 @@ namespace CursedVMA
         internal VmaBlockVector? GetDefaultBlockVector(uint memoryTypeIndex)
             => m_pBlockVectors[memoryTypeIndex];
 
+        internal int PoolCount { get { lock (m_PoolsMutex) return m_Pools.Count; } }
+
         private void RequireNotDisposed()
         {
             if (m_IsDisposed)
@@ -202,7 +306,6 @@ namespace CursedVMA
         {
             bool isSmallHeap = heapSize <= SmallHeapMaxSize;
             ulong raw = isSmallHeap ? heapSize / 8 : preferredLargeHeapBlockSize;
-            // Round up to a 32-byte boundary, matching VMA's VmaAlignUp call.
             return VmaMath.AlignUp(raw, 32ul);
         }
     }

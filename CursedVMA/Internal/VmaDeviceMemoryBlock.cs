@@ -50,7 +50,8 @@ namespace CursedVMA.Internal
             uint id,
             VmaPoolCreateFlags algorithm,
             ulong bufferImageGranularity,
-            out VmaDeviceMemoryBlock? block)
+            out VmaDeviceMemoryBlock? block,
+            nint pMemoryAllocateNext = 0)
         {
             block = null;
             if (size == 0)
@@ -59,6 +60,7 @@ namespace CursedVMA.Internal
             var allocInfo = new MemoryAllocateInfo
             {
                 SType = StructureType.MemoryAllocateInfo,
+                PNext = (void*)pMemoryAllocateNext,
                 MemoryTypeIndex = memoryTypeIndex,
                 AllocationSize = size,
             };

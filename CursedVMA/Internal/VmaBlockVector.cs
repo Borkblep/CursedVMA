@@ -23,6 +23,10 @@ namespace CursedVMA.Internal
         private readonly bool m_ExplicitBlockSize;
         private readonly ulong m_MinAllocationAlignment;
 
+        // Stored as nint (opaque pointer) to pass through to VkMemoryAllocateInfo.pNext.
+        // The pointed-to memory must remain valid for the lifetime of the block vector.
+        private readonly nint m_pMemoryAllocateNext;
+
         private readonly List<VmaDeviceMemoryBlock> m_Blocks = new List<VmaDeviceMemoryBlock>();
         private uint m_NextBlockId;
         private readonly object m_MutexLock = new object();
@@ -38,7 +42,8 @@ namespace CursedVMA.Internal
             ulong bufferImageGranularity,
             VmaPoolCreateFlags algorithm,
             bool explicitBlockSize,
-            ulong minAllocationAlignment)
+            ulong minAllocationAlignment,
+            nint pMemoryAllocateNext = 0)
         {
             m_VkFunctions = vkFunctions;
             m_Device = device;
@@ -51,6 +56,7 @@ namespace CursedVMA.Internal
             m_Algorithm = algorithm;
             m_ExplicitBlockSize = explicitBlockSize;
             m_MinAllocationAlignment = minAllocationAlignment;
+            m_pMemoryAllocateNext = pMemoryAllocateNext;
         }
 
         internal uint MemoryTypeIndex => m_MemoryTypeIndex;
@@ -97,7 +103,8 @@ namespace CursedVMA.Internal
                 m_VkFunctions, m_Device, pAc,
                 m_MemoryTypeIndex, blockSize, blockId,
                 m_Algorithm, m_BufferImageGranularity,
-                out VmaDeviceMemoryBlock? block);
+                out VmaDeviceMemoryBlock? block,
+                m_pMemoryAllocateNext);
 
             if (r != Result.Success)
                 return r;

@@ -1,9 +1,9 @@
 // Ports VmaBlockVector from vk_mem_alloc.cpp. Manages a sorted list of
 // VmaDeviceMemoryBlock objects all allocated from the same Vulkan memory type.
-// In Phase 7 this covers lifecycle only (create/destroy blocks, statistics).
-// Actual sub-allocation (AllocatePage/Free) is added in Phase 9.
+// Phase 7: lifecycle and statistics. Phase 9: AllocatePage / Free.
 
 using Silk.NET.Vulkan;
+using System;
 using System.Collections.Generic;
 
 namespace CursedVMA.Internal
@@ -157,6 +157,113 @@ namespace CursedVMA.Internal
                 foreach (var block in m_Blocks)
                     block.Destroy(m_VkFunctions, m_Device, pAc);
                 m_Blocks.Clear();
+            }
+        }
+
+        /// <summary>
+        /// Finds a suballocation within an existing block or creates a new block to
+        /// satisfy the request. Equivalent to <c>VmaBlockVector::AllocatePage</c>.
+        /// </summary>
+        /// <remarks>
+        /// Dedicated allocations (<see cref="VmaAllocationCreateFlags.DedicatedMemoryBit"/>)
+        /// are not handled here; that path lands in Phase 10.
+        /// </remarks>
+        internal Result AllocatePage(
+            ulong size,
+            ulong alignment,
+            VmaAllocationCreateFlags flags,
+            VmaSuballocationType suballocType,
+            out VmaAllocation? allocation)
+        {
+            allocation = null;
+            if (size == 0)
+                return Result.ErrorInitializationFailed;
+
+            bool neverAllocate = (flags & VmaAllocationCreateFlags.NeverAllocateBit) != 0;
+            bool upperAddress  = (flags & VmaAllocationCreateFlags.UpperAddressBit)  != 0;
+            uint strategy      = (uint)(flags & VmaAllocationCreateFlags.StrategyMask);
+            ulong effectiveAlignment = Math.Max(alignment, m_MinAllocationAlignment);
+
+            // Worst-case padding: an allocation of `size` may need up to
+            // (effectiveAlignment - 1) extra bytes to reach its first aligned offset.
+            ulong newBlockSize;
+            lock (m_MutexLock)
+            {
+                foreach (var block in m_Blocks)
+                {
+                    if (TryAllocFromBlock(block, size, effectiveAlignment, upperAddress,
+                            suballocType, strategy, out allocation))
+                        return Result.Success;
+                }
+
+                if (neverAllocate)
+                    return Result.ErrorOutOfDeviceMemory;
+
+                ulong minBlockForAlloc = size + (effectiveAlignment > 1 ? effectiveAlignment - 1 : 0);
+                newBlockSize = m_ExplicitBlockSize
+                    ? m_PreferredBlockSize
+                    : Math.Max(m_PreferredBlockSize, minBlockForAlloc);
+            }
+
+            // Create a new block outside the lock so vkAllocateMemory doesn't hold it.
+            Result r = CreateBlock(newBlockSize, out _);
+            if (r != Result.Success)
+                return r;
+
+            // Retry all blocks — the new one is now in the list.
+            lock (m_MutexLock)
+            {
+                foreach (var block in m_Blocks)
+                {
+                    if (TryAllocFromBlock(block, size, effectiveAlignment, upperAddress,
+                            suballocType, strategy, out allocation))
+                        return Result.Success;
+                }
+                return Result.ErrorOutOfDeviceMemory;
+            }
+        }
+
+        private bool TryAllocFromBlock(
+            VmaDeviceMemoryBlock block,
+            ulong size,
+            ulong alignment,
+            bool upperAddress,
+            VmaSuballocationType suballocType,
+            uint strategy,
+            out VmaAllocation? allocation)
+        {
+            if (block.Metadata.CreateAllocationRequest(
+                    size, alignment, upperAddress, suballocType, strategy, out var request))
+            {
+                block.Metadata.Alloc(in request, suballocType, null);
+                ulong offset = block.Metadata.GetAllocationOffset(request.AllocHandle);
+                allocation = VmaAllocation.CreateBlockAllocation(
+                    this, block, request.AllocHandle, offset, size, alignment, m_MemoryTypeIndex);
+                return true;
+            }
+            allocation = null;
+            return false;
+        }
+
+        /// <summary>
+        /// Returns a suballocation to its block and frees the block if it becomes
+        /// empty and we are above the minimum block count. Equivalent to
+        /// <c>VmaBlockVector::Free</c>.
+        /// </summary>
+        internal unsafe void Free(VmaAllocation allocation)
+        {
+            var block = allocation.Block;
+            lock (m_MutexLock)
+            {
+                block.Metadata.Free(allocation.AllocHandle);
+
+                if ((nuint)m_Blocks.Count > m_MinBlockCount && block.IsEmpty())
+                {
+                    AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
+                    AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
+                    block.Destroy(m_VkFunctions, m_Device, pAc);
+                    m_Blocks.Remove(block);
+                }
             }
         }
 

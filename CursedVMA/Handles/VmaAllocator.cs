@@ -259,6 +259,249 @@ namespace CursedVMA
             pool.Dispose();
         }
 
+        // ── Phase 9: per-allocation entry-points ──────────────────────────────
+
+        /// <summary>
+        /// Selects the Vulkan memory type index that best satisfies the given
+        /// requirements and allocation preferences. Equivalent to
+        /// <c>vmaFindMemoryTypeIndex</c>.
+        /// </summary>
+        /// <param name="memoryTypeBits">Bitmask of acceptable types, typically
+        /// from <see cref="MemoryRequirements.MemoryTypeBits"/>.</param>
+        /// <param name="allocationCreateInfo">Usage and property-flag hints.</param>
+        /// <param name="memoryTypeIndex">On success, the chosen type index.</param>
+        /// <returns><see cref="Result.Success"/> when a matching type is found;
+        /// <see cref="Result.ErrorFeatureNotPresent"/> otherwise.</returns>
+        public Result FindMemoryTypeIndex(
+            uint memoryTypeBits,
+            in VmaAllocationCreateInfo allocationCreateInfo,
+            out uint memoryTypeIndex)
+        {
+            RequireNotDisposed();
+            memoryTypeIndex = uint.MaxValue;
+
+            // MemoryTypeBits == 0 means "no filter" (allow all), matching C++ VMA.
+            uint filter = allocationCreateInfo.MemoryTypeBits == 0
+                ? uint.MaxValue
+                : allocationCreateInfo.MemoryTypeBits;
+            uint candidates = memoryTypeBits & filter;
+
+            UsageToFlags(in allocationCreateInfo,
+                out MemoryPropertyFlags required, out MemoryPropertyFlags preferred);
+            required  |= allocationCreateInfo.RequiredFlags;
+            preferred |= allocationCreateInfo.PreferredFlags;
+
+            int bestScore = -1;
+            for (uint i = 0; i < MemoryTypeCount; i++)
+            {
+                if ((candidates & (1u << (int)i)) == 0)
+                    continue;
+
+                MemoryPropertyFlags typeFlags = GetMemoryType(i).PropertyFlags;
+                if ((typeFlags & required) != required)
+                    continue;
+
+                // Count how many preferred bits this type satisfies.
+                int score = CountBits((uint)(typeFlags & preferred));
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    memoryTypeIndex = i;
+                }
+            }
+
+            return memoryTypeIndex != uint.MaxValue
+                ? Result.Success
+                : Result.ErrorFeatureNotPresent;
+        }
+
+        /// <summary>
+        /// Allocates memory satisfying the given Vulkan memory requirements and
+        /// VMA creation flags. When <see cref="VmaAllocationCreateInfo.Pool"/> is
+        /// set the allocation is drawn from that pool; otherwise VMA selects the
+        /// memory type and uses the corresponding default block vector.
+        /// Equivalent to <c>vmaAllocateMemory</c>.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="VmaAllocationCreateFlags.DedicatedMemoryBit"/> is not yet
+        /// implemented; it is silently treated as a block allocation (Phase 10).
+        /// </remarks>
+        public Result AllocateMemory(
+            in MemoryRequirements vkMemReq,
+            in VmaAllocationCreateInfo createInfo,
+            out VmaAllocation? allocation)
+        {
+            RequireNotDisposed();
+            return AllocateMemoryInternal(
+                in vkMemReq, VmaSuballocationType.Unknown, in createInfo, out allocation);
+        }
+
+        /// <summary>
+        /// Queries <c>vkGetBufferMemoryRequirements</c> and allocates memory
+        /// suitable for binding to <paramref name="buffer"/>. Equivalent to
+        /// <c>vmaAllocateMemoryForBuffer</c>.
+        /// </summary>
+        public Result AllocateMemoryForBuffer(
+            Silk.NET.Vulkan.Buffer buffer,
+            in VmaAllocationCreateInfo createInfo,
+            out VmaAllocation? allocation)
+        {
+            RequireNotDisposed();
+            VkFunctions.GetBufferMemoryRequirements(Device, buffer, out MemoryRequirements req);
+            return AllocateMemoryInternal(
+                in req, VmaSuballocationType.Buffer, in createInfo, out allocation);
+        }
+
+        /// <summary>
+        /// Queries <c>vkGetImageMemoryRequirements</c> and allocates memory
+        /// suitable for binding to <paramref name="image"/>. Uses
+        /// <see cref="VmaSuballocationType.ImageOptimal"/> (the common case).
+        /// Equivalent to <c>vmaAllocateMemoryForImage</c>.
+        /// </summary>
+        public Result AllocateMemoryForImage(
+            Image image,
+            in VmaAllocationCreateInfo createInfo,
+            out VmaAllocation? allocation)
+        {
+            RequireNotDisposed();
+            VkFunctions.GetImageMemoryRequirements(Device, image, out MemoryRequirements req);
+            return AllocateMemoryInternal(
+                in req, VmaSuballocationType.ImageOptimal, in createInfo, out allocation);
+        }
+
+        /// <summary>
+        /// Releases an allocation and returns its memory to the pool. Null-safe.
+        /// Equivalent to <c>vmaFreeMemory</c>.
+        /// </summary>
+        public void FreeMemory(VmaAllocation? allocation)
+        {
+            RequireNotDisposed();
+            if (allocation == null)
+                return;
+            allocation.OwningBlockVector.Free(allocation);
+        }
+
+        /// <summary>
+        /// Fills <paramref name="info"/> with a snapshot of the allocation's
+        /// current state. Equivalent to <c>vmaGetAllocationInfo</c>.
+        /// </summary>
+        public unsafe void GetAllocationInfo(VmaAllocation allocation, out VmaAllocationInfo info)
+        {
+            RequireNotDisposed();
+            allocation.GetInfo(out info);
+        }
+
+        /// <summary>
+        /// Attaches arbitrary user data to an allocation. Equivalent to
+        /// <c>vmaSetAllocationUserData</c>.
+        /// </summary>
+        public void SetAllocationUserData(VmaAllocation allocation, object? userData)
+        {
+            RequireNotDisposed();
+            allocation.UserData = userData;
+        }
+
+        /// <summary>
+        /// Attaches a debug name to an allocation. Equivalent to
+        /// <c>vmaSetAllocationName</c>.
+        /// </summary>
+        public void SetAllocationName(VmaAllocation allocation, string? name)
+        {
+            RequireNotDisposed();
+            allocation.Name = name;
+        }
+
+        /// <summary>
+        /// Maps the allocation's memory and returns a host-accessible pointer.
+        /// Reference-counted: each <see cref="MapMemory"/> must be paired with
+        /// an <see cref="UnmapMemory"/>. Equivalent to <c>vmaMapMemory</c>.
+        /// </summary>
+        public unsafe Result MapMemory(VmaAllocation allocation, out void* ppData)
+        {
+            RequireNotDisposed();
+            ppData = null;
+            Result r = allocation.Block.Map(VkFunctions, Device, count: 1, out void* blockData);
+            if (r != Result.Success)
+                return r;
+            allocation.OnMapped(blockData);
+            ppData = allocation.MappedData;
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Decrements the allocation's map reference count; calls
+        /// <c>vkUnmapMemory</c> when it reaches zero. Equivalent to
+        /// <c>vmaUnmapMemory</c>.
+        /// </summary>
+        public void UnmapMemory(VmaAllocation allocation)
+        {
+            RequireNotDisposed();
+            allocation.OnUnmapped();
+            allocation.Block.Unmap(VkFunctions, Device, count: 1);
+        }
+
+        /// <summary>
+        /// Binds a buffer to this allocation's memory at
+        /// <c>allocation.Offset</c>. Equivalent to <c>vmaBindBufferMemory</c>.
+        /// </summary>
+        public unsafe Result BindBufferMemory(
+            VmaAllocation allocation,
+            Silk.NET.Vulkan.Buffer buffer)
+        {
+            RequireNotDisposed();
+            return allocation.Block.BindBufferMemory(
+                VkFunctions, Device, allocation.Offset, buffer, null);
+        }
+
+        /// <summary>
+        /// Binds a buffer to this allocation's memory at
+        /// <c>allocation.Offset + allocationLocalOffset</c>, forwarding
+        /// <paramref name="pNext"/> to <c>vkBindBufferMemory2</c>. Equivalent
+        /// to <c>vmaBindBufferMemory2</c>.
+        /// </summary>
+        public unsafe Result BindBufferMemory2(
+            VmaAllocation allocation,
+            ulong allocationLocalOffset,
+            Silk.NET.Vulkan.Buffer buffer,
+            void* pNext)
+        {
+            RequireNotDisposed();
+            return allocation.Block.BindBufferMemory(
+                VkFunctions, Device,
+                allocation.Offset + allocationLocalOffset, buffer, pNext);
+        }
+
+        /// <summary>
+        /// Binds an image to this allocation's memory at
+        /// <c>allocation.Offset</c>. Equivalent to <c>vmaBindImageMemory</c>.
+        /// </summary>
+        public unsafe Result BindImageMemory(VmaAllocation allocation, Image image)
+        {
+            RequireNotDisposed();
+            return allocation.Block.BindImageMemory(
+                VkFunctions, Device, allocation.Offset, image, null);
+        }
+
+        /// <summary>
+        /// Binds an image to this allocation's memory at
+        /// <c>allocation.Offset + allocationLocalOffset</c>, forwarding
+        /// <paramref name="pNext"/> to <c>vkBindImageMemory2</c>. Equivalent
+        /// to <c>vmaBindImageMemory2</c>.
+        /// </summary>
+        public unsafe Result BindImageMemory2(
+            VmaAllocation allocation,
+            ulong allocationLocalOffset,
+            Image image,
+            void* pNext)
+        {
+            RequireNotDisposed();
+            return allocation.Block.BindImageMemory(
+                VkFunctions, Device,
+                allocation.Offset + allocationLocalOffset, image, pNext);
+        }
+
+        // ── Tears down all default block vectors ──────────────────────────────
+
         /// <summary>
         /// Tears down all default block vectors. Pools created via
         /// <see cref="CreatePool"/> are user-owned and must be explicitly
@@ -277,7 +520,7 @@ namespace CursedVMA
             }
         }
 
-        // --- Internal accessors used by later phases ---
+        // --- Internal accessors ---
 
         internal uint MemoryTypeCount => MemoryProperties.MemoryTypeCount;
 
@@ -296,6 +539,133 @@ namespace CursedVMA
         {
             if (m_IsDisposed)
                 throw new ObjectDisposedException(nameof(VmaAllocator));
+        }
+
+        // --- Private allocation helpers ---
+
+        private Result AllocateMemoryInternal(
+            in MemoryRequirements vkMemReq,
+            VmaSuballocationType suballocType,
+            in VmaAllocationCreateInfo createInfo,
+            out VmaAllocation? allocation)
+        {
+            allocation = null;
+
+            // Pool path: skip type selection, use the pool's block vector.
+            if (createInfo.Pool != null)
+            {
+                Result pr = createInfo.Pool.BlockVector.AllocatePage(
+                    vkMemReq.Size, vkMemReq.Alignment,
+                    createInfo.Flags, suballocType, out allocation);
+                if (pr != Result.Success)
+                    return pr;
+                return FinishAllocation(allocation!, in createInfo);
+            }
+
+            // Default path: select memory type, then use its block vector.
+            Result r = FindMemoryTypeIndex(vkMemReq.MemoryTypeBits, in createInfo,
+                out uint memTypeIndex);
+            if (r != Result.Success)
+                return r;
+
+            var blockVector = GetDefaultBlockVector(memTypeIndex);
+            if (blockVector == null)
+                return Result.ErrorInitializationFailed;
+
+            r = blockVector.AllocatePage(
+                vkMemReq.Size, vkMemReq.Alignment,
+                createInfo.Flags, suballocType, out allocation);
+            if (r != Result.Success)
+                return r;
+
+            return FinishAllocation(allocation!, in createInfo);
+        }
+
+        private unsafe Result FinishAllocation(
+            VmaAllocation allocation,
+            in VmaAllocationCreateInfo createInfo)
+        {
+            if (createInfo.UserData != null)
+                allocation.UserData = createInfo.UserData;
+
+            if ((createInfo.Flags & VmaAllocationCreateFlags.MappedBit) != 0)
+            {
+                Result r = MapMemory(allocation, out _);
+                if (r != Result.Success)
+                {
+                    FreeMemory(allocation);
+                    return r;
+                }
+            }
+            return Result.Success;
+        }
+
+        // Maps VmaMemoryUsage (plus host-access flags) to Vulkan required/preferred
+        // property flags. Mirrors vma_usage_to_required_preferred_flags in C++ VMA.
+        private static void UsageToFlags(
+            in VmaAllocationCreateInfo createInfo,
+            out MemoryPropertyFlags required,
+            out MemoryPropertyFlags preferred)
+        {
+            required  = MemoryPropertyFlags.None;
+            preferred = MemoryPropertyFlags.None;
+
+            bool hostSeqWrite = (createInfo.Flags & VmaAllocationCreateFlags.HostAccessSequentialWriteBit) != 0;
+            bool hostRandom   = (createInfo.Flags & VmaAllocationCreateFlags.HostAccessRandomBit)          != 0;
+
+            switch (createInfo.Usage)
+            {
+                case VmaMemoryUsage.GpuOnly:
+                    preferred |= MemoryPropertyFlags.DeviceLocalBit;
+                    break;
+
+                case VmaMemoryUsage.CpuOnly:
+                    required |= MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit;
+                    break;
+
+                case VmaMemoryUsage.CpuToGpu:
+                    required  |= MemoryPropertyFlags.HostVisibleBit;
+                    preferred |= MemoryPropertyFlags.DeviceLocalBit;
+                    break;
+
+                case VmaMemoryUsage.GpuToCpu:
+                    required  |= MemoryPropertyFlags.HostVisibleBit;
+                    preferred |= MemoryPropertyFlags.HostCachedBit;
+                    break;
+
+                case VmaMemoryUsage.CpuCopy:
+                    required |= MemoryPropertyFlags.HostVisibleBit;
+                    break;
+
+                case VmaMemoryUsage.GpuLazilyAllocated:
+                    required |= MemoryPropertyFlags.LazilyAllocatedBit;
+                    break;
+
+                case VmaMemoryUsage.Auto:
+                case VmaMemoryUsage.AutoPreferDevice:
+                case VmaMemoryUsage.AutoPreferHost:
+                    if (hostSeqWrite || hostRandom)
+                    {
+                        required |= MemoryPropertyFlags.HostVisibleBit;
+                        preferred |= hostRandom
+                            ? MemoryPropertyFlags.HostCachedBit
+                            : MemoryPropertyFlags.HostCoherentBit;
+                    }
+                    if (createInfo.Usage == VmaMemoryUsage.AutoPreferDevice)
+                        preferred |= MemoryPropertyFlags.DeviceLocalBit;
+                    else if (createInfo.Usage == VmaMemoryUsage.AutoPreferHost)
+                        preferred |= MemoryPropertyFlags.HostVisibleBit;
+                    else if (!hostSeqWrite && !hostRandom)
+                        preferred |= MemoryPropertyFlags.DeviceLocalBit;
+                    break;
+            }
+        }
+
+        private static int CountBits(uint v)
+        {
+            int n = 0;
+            while (v != 0) { v &= v - 1; n++; }
+            return n;
         }
 
         // --- Helpers ---

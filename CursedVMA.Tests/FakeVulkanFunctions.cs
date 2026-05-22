@@ -33,6 +33,10 @@ namespace CursedVMA.Tests
         public PhysicalDeviceMemoryProperties MemoryProperties;
         public PhysicalDeviceProperties DeviceProperties = default;
 
+        // Configurable responses for buffer/image memory requirement queries.
+        public MemoryRequirements BufferMemoryRequirements = default;
+        public MemoryRequirements ImageMemoryRequirements = default;
+
         private ulong m_NextMemoryHandle = 1;
 
         public Result AllocateMemory(
@@ -100,11 +104,11 @@ namespace CursedVMA.Tests
 
         public void GetBufferMemoryRequirements(
             Device device, Silk.NET.Vulkan.Buffer buffer, out MemoryRequirements r)
-            => r = default;
+            => r = BufferMemoryRequirements;
 
         public void GetImageMemoryRequirements(
             Device device, Image image, out MemoryRequirements r)
-            => r = default;
+            => r = ImageMemoryRequirements;
 
         public void GetPhysicalDeviceMemoryProperties(
             PhysicalDevice pd, out PhysicalDeviceMemoryProperties r)

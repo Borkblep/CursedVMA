@@ -1,7 +1,7 @@
-// Ports VmaAllocator_T from vk_mem_alloc.cpp. Phase 7 implemented the core
-// lifecycle. Phase 8 adds CreatePool / DestroyPool and per-pool tracking.
-// Actual per-allocation entry-points (AllocateMemory, FreeMemory, …) land
-// in Phase 9.
+// Ports VmaAllocator_T from vk_mem_alloc.cpp. Phase 7: core lifecycle.
+// Phase 8: CreatePool / DestroyPool. Phase 9: per-allocation API
+// (AllocateMemory, FreeMemory, Map/Unmap, Bind*). Phase 10: dedicated
+// allocations triggered by VmaAllocationCreateFlags.DedicatedMemoryBit.
 
 using CursedVMA.Internal;
 using Silk.NET.Vulkan;
@@ -40,6 +40,11 @@ namespace CursedVMA
         private readonly List<VmaPool> m_Pools = new List<VmaPool>();
         private readonly object m_PoolsMutex = new object();
         private uint m_NextPoolId;
+
+        // Dedicated allocations tracked for Dispose cleanup and statistics.
+        private readonly List<VmaAllocation> m_DedicatedAllocations =
+            new List<VmaAllocation>();
+        private readonly object m_DedicatedMutex = new object();
 
         private bool m_IsDisposed;
 
@@ -318,14 +323,12 @@ namespace CursedVMA
         /// <summary>
         /// Allocates memory satisfying the given Vulkan memory requirements and
         /// VMA creation flags. When <see cref="VmaAllocationCreateInfo.Pool"/> is
-        /// set the allocation is drawn from that pool; otherwise VMA selects the
-        /// memory type and uses the corresponding default block vector.
+        /// set the allocation is drawn from that pool; when
+        /// <see cref="VmaAllocationCreateFlags.DedicatedMemoryBit"/> is set the
+        /// allocation owns its own <c>VkDeviceMemory</c>; otherwise VMA selects
+        /// the memory type and uses the corresponding default block vector.
         /// Equivalent to <c>vmaAllocateMemory</c>.
         /// </summary>
-        /// <remarks>
-        /// <see cref="VmaAllocationCreateFlags.DedicatedMemoryBit"/> is not yet
-        /// implemented; it is silently treated as a block allocation (Phase 10).
-        /// </remarks>
         public Result AllocateMemory(
             in MemoryRequirements vkMemReq,
             in VmaAllocationCreateInfo createInfo,
@@ -371,6 +374,7 @@ namespace CursedVMA
 
         /// <summary>
         /// Releases an allocation and returns its memory to the pool. Null-safe.
+        /// Dedicated allocations have their <c>VkDeviceMemory</c> freed directly.
         /// Equivalent to <c>vmaFreeMemory</c>.
         /// </summary>
         public void FreeMemory(VmaAllocation? allocation)
@@ -378,7 +382,29 @@ namespace CursedVMA
             RequireNotDisposed();
             if (allocation == null)
                 return;
-            allocation.OwningBlockVector.Free(allocation);
+            if (allocation.IsDedicated)
+                FreeDedicatedMemory(allocation);
+            else
+                allocation.OwningBlockVector.Free(allocation);
+        }
+
+        /// <summary>
+        /// Fills <paramref name="info"/> with extended allocation state including
+        /// the parent block size and a dedicated-allocation flag. Equivalent to
+        /// <c>vmaGetAllocationInfo2</c>.
+        /// </summary>
+        public unsafe void GetAllocationInfo2(VmaAllocation allocation, out VmaAllocationInfo2 info)
+        {
+            RequireNotDisposed();
+            allocation.GetInfo(out VmaAllocationInfo baseInfo);
+            info = new VmaAllocationInfo2
+            {
+                AllocationInfo = baseInfo,
+                BlockSize = allocation.IsDedicated
+                    ? allocation.Size
+                    : allocation.Block.Metadata.GetSize(),
+                DedicatedMemory = allocation.IsDedicated,
+            };
         }
 
         /// <summary>
@@ -419,13 +445,7 @@ namespace CursedVMA
         public unsafe Result MapMemory(VmaAllocation allocation, out void* ppData)
         {
             RequireNotDisposed();
-            ppData = null;
-            Result r = allocation.Block.Map(VkFunctions, Device, count: 1, out void* blockData);
-            if (r != Result.Success)
-                return r;
-            allocation.OnMapped(blockData);
-            ppData = allocation.MappedData;
-            return Result.Success;
+            return allocation.Map(VkFunctions, Device, out ppData);
         }
 
         /// <summary>
@@ -436,8 +456,7 @@ namespace CursedVMA
         public void UnmapMemory(VmaAllocation allocation)
         {
             RequireNotDisposed();
-            allocation.OnUnmapped();
-            allocation.Block.Unmap(VkFunctions, Device, count: 1);
+            allocation.Unmap(VkFunctions, Device);
         }
 
         /// <summary>
@@ -449,8 +468,7 @@ namespace CursedVMA
             Silk.NET.Vulkan.Buffer buffer)
         {
             RequireNotDisposed();
-            return allocation.Block.BindBufferMemory(
-                VkFunctions, Device, allocation.Offset, buffer, null);
+            return allocation.BindBufferMemory(VkFunctions, Device, 0, buffer, null);
         }
 
         /// <summary>
@@ -466,9 +484,8 @@ namespace CursedVMA
             void* pNext)
         {
             RequireNotDisposed();
-            return allocation.Block.BindBufferMemory(
-                VkFunctions, Device,
-                allocation.Offset + allocationLocalOffset, buffer, pNext);
+            return allocation.BindBufferMemory(
+                VkFunctions, Device, allocationLocalOffset, buffer, pNext);
         }
 
         /// <summary>
@@ -478,8 +495,7 @@ namespace CursedVMA
         public unsafe Result BindImageMemory(VmaAllocation allocation, Image image)
         {
             RequireNotDisposed();
-            return allocation.Block.BindImageMemory(
-                VkFunctions, Device, allocation.Offset, image, null);
+            return allocation.BindImageMemory(VkFunctions, Device, 0, image, null);
         }
 
         /// <summary>
@@ -495,23 +511,36 @@ namespace CursedVMA
             void* pNext)
         {
             RequireNotDisposed();
-            return allocation.Block.BindImageMemory(
-                VkFunctions, Device,
-                allocation.Offset + allocationLocalOffset, image, pNext);
+            return allocation.BindImageMemory(
+                VkFunctions, Device, allocationLocalOffset, image, pNext);
         }
 
         // ── Tears down all default block vectors ──────────────────────────────
 
         /// <summary>
-        /// Tears down all default block vectors. Pools created via
-        /// <see cref="CreatePool"/> are user-owned and must be explicitly
-        /// destroyed with <see cref="DestroyPool"/> before this call.
-        /// Equivalent to <c>vmaDestroyAllocator</c>. Safe to call more than once.
+        /// Tears down all default block vectors and frees every still-live
+        /// dedicated allocation. Pools created via <see cref="CreatePool"/> are
+        /// user-owned and must be explicitly destroyed with
+        /// <see cref="DestroyPool"/> before this call. Equivalent to
+        /// <c>vmaDestroyAllocator</c>. Safe to call more than once.
         /// </summary>
-        public void Dispose()
+        public unsafe void Dispose()
         {
             if (m_IsDisposed) return;
             m_IsDisposed = true;
+
+            // Free any dedicated allocations the caller didn't release.
+            lock (m_DedicatedMutex)
+            {
+                if (m_DedicatedAllocations.Count > 0)
+                {
+                    AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+                    AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+                    foreach (var alloc in m_DedicatedAllocations)
+                        VkFunctions.FreeMemory(Device, alloc.DedicatedMemory, pAc);
+                    m_DedicatedAllocations.Clear();
+                }
+            }
 
             for (int i = 0; i < m_pBlockVectors.Length; i++)
             {
@@ -552,6 +581,7 @@ namespace CursedVMA
             allocation = null;
 
             // Pool path: skip type selection, use the pool's block vector.
+            // DedicatedMemoryBit is invalid here per VMA's contract; ignored.
             if (createInfo.Pool != null)
             {
                 Result pr = createInfo.Pool.BlockVector.AllocatePage(
@@ -562,11 +592,21 @@ namespace CursedVMA
                 return FinishAllocation(allocation!, in createInfo);
             }
 
-            // Default path: select memory type, then use its block vector.
+            // Default path: select memory type first.
             Result r = FindMemoryTypeIndex(vkMemReq.MemoryTypeBits, in createInfo,
                 out uint memTypeIndex);
             if (r != Result.Success)
                 return r;
+
+            // Dedicated path bypasses the block vector entirely.
+            if ((createInfo.Flags & VmaAllocationCreateFlags.DedicatedMemoryBit) != 0)
+            {
+                r = AllocateDedicatedMemory(memTypeIndex, vkMemReq.Size,
+                    vkMemReq.Alignment, out allocation);
+                if (r != Result.Success)
+                    return r;
+                return FinishAllocation(allocation!, in createInfo);
+            }
 
             var blockVector = GetDefaultBlockVector(memTypeIndex);
             if (blockVector == null)
@@ -580,6 +620,53 @@ namespace CursedVMA
 
             return FinishAllocation(allocation!, in createInfo);
         }
+
+        private unsafe Result AllocateDedicatedMemory(
+            uint memoryTypeIndex,
+            ulong size,
+            ulong alignment,
+            out VmaAllocation? allocation)
+        {
+            allocation = null;
+            if (size == 0)
+                return Result.ErrorInitializationFailed;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            var allocInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = size,
+                MemoryTypeIndex = memoryTypeIndex,
+            };
+
+            Result r = VkFunctions.AllocateMemory(
+                Device, in allocInfo, pAc, out DeviceMemory memory);
+            if (r != Result.Success)
+                return r;
+
+            allocation = VmaAllocation.CreateDedicatedAllocation(
+                memory, size, alignment, memoryTypeIndex);
+
+            lock (m_DedicatedMutex)
+                m_DedicatedAllocations.Add(allocation);
+
+            return Result.Success;
+        }
+
+        private unsafe void FreeDedicatedMemory(VmaAllocation allocation)
+        {
+            lock (m_DedicatedMutex)
+                m_DedicatedAllocations.Remove(allocation);
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+            VkFunctions.FreeMemory(Device, allocation.DedicatedMemory, pAc);
+        }
+
+        internal int DedicatedAllocationCount
+        { get { lock (m_DedicatedMutex) return m_DedicatedAllocations.Count; } }
 
         private unsafe Result FinishAllocation(
             VmaAllocation allocation,

@@ -4,7 +4,9 @@
 // allocations triggered by VmaAllocationCreateFlags.DedicatedMemoryBit.
 // Phase 11: allocator-wide statistics (GetStatistics, CalculateStatistics)
 // and heap budgets (GetHeapBudgets). Phase 12: GetAllocatorInfo and JSON
-// statistics dump (BuildStatsString).
+// statistics dump (BuildStatsString). Phase 13: high-level convenience API
+// (CreateBuffer/CreateImage), batch AllocateMemoryPages, and cache control
+// (FlushAllocation/InvalidateAllocation).
 
 using CursedVMA.Internal;
 using Silk.NET.Vulkan;
@@ -896,6 +898,268 @@ namespace CursedVMA
             uint minor = (v >> 12) & 0x3FFu;
             uint patch =  v        & 0xFFFu;
             return $"{major}.{minor}.{patch}";
+        }
+
+        // ── Phase 13: high-level convenience and cache control ───────────────
+
+        /// <summary>
+        /// Creates a <c>VkBuffer</c>, allocates memory for it, and binds the
+        /// buffer to that memory. On failure all partial state is rolled back.
+        /// Equivalent to <c>vmaCreateBuffer</c>.
+        /// </summary>
+        public unsafe Result CreateBuffer(
+            in BufferCreateInfo bufferCreateInfo,
+            in VmaAllocationCreateInfo allocationCreateInfo,
+            out Silk.NET.Vulkan.Buffer buffer,
+            out VmaAllocation? allocation,
+            out VmaAllocationInfo allocationInfo)
+        {
+            RequireNotDisposed();
+            buffer         = default;
+            allocation     = null;
+            allocationInfo = default;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateBuffer(Device, in bufferCreateInfo, pAc, out buffer);
+            if (r != Result.Success)
+                return r;
+
+            r = AllocateMemoryForBuffer(buffer, in allocationCreateInfo, out allocation);
+            if (r != Result.Success)
+            {
+                VkFunctions.DestroyBuffer(Device, buffer, pAc);
+                buffer = default;
+                return r;
+            }
+
+            r = BindBufferMemory(allocation!, buffer);
+            if (r != Result.Success)
+            {
+                FreeMemory(allocation);
+                VkFunctions.DestroyBuffer(Device, buffer, pAc);
+                buffer     = default;
+                allocation = null;
+                return r;
+            }
+
+            allocation!.GetInfo(out allocationInfo);
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Destroys a buffer created by <see cref="CreateBuffer"/> and frees its
+        /// allocation. Either argument may be null/default. Equivalent to
+        /// <c>vmaDestroyBuffer</c>.
+        /// </summary>
+        public unsafe void DestroyBuffer(Silk.NET.Vulkan.Buffer buffer, VmaAllocation? allocation)
+        {
+            RequireNotDisposed();
+            if (buffer.Handle != 0ul)
+            {
+                AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+                AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+                VkFunctions.DestroyBuffer(Device, buffer, pAc);
+            }
+            if (allocation != null)
+                FreeMemory(allocation);
+        }
+
+        /// <summary>
+        /// Creates a <c>VkImage</c>, allocates memory for it, and binds the
+        /// image to that memory. On failure all partial state is rolled back.
+        /// Equivalent to <c>vmaCreateImage</c>.
+        /// </summary>
+        public unsafe Result CreateImage(
+            in ImageCreateInfo imageCreateInfo,
+            in VmaAllocationCreateInfo allocationCreateInfo,
+            out Image image,
+            out VmaAllocation? allocation,
+            out VmaAllocationInfo allocationInfo)
+        {
+            RequireNotDisposed();
+            image          = default;
+            allocation     = null;
+            allocationInfo = default;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateImage(Device, in imageCreateInfo, pAc, out image);
+            if (r != Result.Success)
+                return r;
+
+            r = AllocateMemoryForImage(image, in allocationCreateInfo, out allocation);
+            if (r != Result.Success)
+            {
+                VkFunctions.DestroyImage(Device, image, pAc);
+                image = default;
+                return r;
+            }
+
+            r = BindImageMemory(allocation!, image);
+            if (r != Result.Success)
+            {
+                FreeMemory(allocation);
+                VkFunctions.DestroyImage(Device, image, pAc);
+                image      = default;
+                allocation = null;
+                return r;
+            }
+
+            allocation!.GetInfo(out allocationInfo);
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Destroys an image created by <see cref="CreateImage"/> and frees its
+        /// allocation. Either argument may be null/default. Equivalent to
+        /// <c>vmaDestroyImage</c>.
+        /// </summary>
+        public unsafe void DestroyImage(Image image, VmaAllocation? allocation)
+        {
+            RequireNotDisposed();
+            if (image.Handle != 0ul)
+            {
+                AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+                AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+                VkFunctions.DestroyImage(Device, image, pAc);
+            }
+            if (allocation != null)
+                FreeMemory(allocation);
+        }
+
+        /// <summary>
+        /// Batch-allocates memory for several resources with all-or-nothing
+        /// semantics. On any per-element failure, every allocation already made
+        /// in the batch is freed. Equivalent to <c>vmaAllocateMemoryPages</c>.
+        /// </summary>
+        public Result AllocateMemoryPages(
+            ReadOnlySpan<MemoryRequirements> memoryRequirements,
+            ReadOnlySpan<VmaAllocationCreateInfo> createInfos,
+            Span<VmaAllocation?> allocations)
+        {
+            RequireNotDisposed();
+            if (memoryRequirements.Length != allocations.Length ||
+                createInfos.Length        != allocations.Length)
+                return Result.ErrorInitializationFailed;
+
+            int allocCount = allocations.Length;
+            for (int i = 0; i < allocCount; i++)
+            {
+                Result r = AllocateMemoryInternal(
+                    in memoryRequirements[i],
+                    VmaSuballocationType.Unknown,
+                    in createInfos[i],
+                    out var a);
+                if (r != Result.Success)
+                {
+                    for (int j = 0; j < i; j++)
+                    {
+                        FreeMemory(allocations[j]);
+                        allocations[j] = null;
+                    }
+                    allocations[i] = null;
+                    return r;
+                }
+                allocations[i] = a;
+            }
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Frees every allocation in <paramref name="allocations"/>; null
+        /// entries are ignored. Equivalent to <c>vmaFreeMemoryPages</c>.
+        /// </summary>
+        public void FreeMemoryPages(ReadOnlySpan<VmaAllocation?> allocations)
+        {
+            RequireNotDisposed();
+            for (int i = 0; i < allocations.Length; i++)
+                if (allocations[i] != null)
+                    FreeMemory(allocations[i]);
+        }
+
+        /// <summary>
+        /// Flushes a host-write of <paramref name="size"/> bytes at
+        /// <paramref name="offset"/> within <paramref name="allocation"/>. No-op
+        /// when the backing memory type is <c>HostCoherent</c>; otherwise the
+        /// range is aligned to <c>nonCoherentAtomSize</c> and forwarded to
+        /// <c>vkFlushMappedMemoryRanges</c>. Pass <c>Vk.WholeSize</c> as
+        /// <paramref name="size"/> to cover the whole allocation. Equivalent
+        /// to <c>vmaFlushAllocation</c>.
+        /// </summary>
+        public unsafe Result FlushAllocation(
+            VmaAllocation allocation, ulong offset, ulong size)
+        {
+            RequireNotDisposed();
+            if (!IsMemoryTypeNonCoherent(allocation.MemoryTypeIndex))
+                return Result.Success;
+
+            MappedMemoryRange range = BuildMappedMemoryRange(allocation, offset, size);
+            return VkFunctions.FlushMappedMemoryRanges(Device, 1, &range);
+        }
+
+        /// <summary>
+        /// Invalidates a CPU cache region before reading host-visible memory.
+        /// Symmetric to <see cref="FlushAllocation"/>; equivalent to
+        /// <c>vmaInvalidateAllocation</c>.
+        /// </summary>
+        public unsafe Result InvalidateAllocation(
+            VmaAllocation allocation, ulong offset, ulong size)
+        {
+            RequireNotDisposed();
+            if (!IsMemoryTypeNonCoherent(allocation.MemoryTypeIndex))
+                return Result.Success;
+
+            MappedMemoryRange range = BuildMappedMemoryRange(allocation, offset, size);
+            return VkFunctions.InvalidateMappedMemoryRanges(Device, 1, &range);
+        }
+
+        private bool IsMemoryTypeNonCoherent(uint memoryTypeIndex)
+        {
+            MemoryPropertyFlags f = GetMemoryType(memoryTypeIndex).PropertyFlags;
+            return (f & MemoryPropertyFlags.HostVisibleBit)  != 0
+                && (f & MemoryPropertyFlags.HostCoherentBit) == 0;
+        }
+
+        // Builds the VkMappedMemoryRange for a flush/invalidate.
+        //   * Offset is rounded down to the nonCoherentAtomSize boundary.
+        //   * Size is rounded up; for VK_WHOLE_SIZE it covers the whole alloc.
+        //   * For block-backed allocations the allocation's offset within the
+        //     VkDeviceMemory is added back in.
+        private MappedMemoryRange BuildMappedMemoryRange(
+            VmaAllocation allocation, ulong offset, ulong size)
+        {
+            ulong atomSize  = DeviceLimits.NonCoherentAtomSize != 0
+                ? DeviceLimits.NonCoherentAtomSize : 1ul;
+            ulong allocSize = allocation.Size;
+
+            ulong alignedOffset = (offset / atomSize) * atomSize;
+            ulong rangeSize;
+            if (size == Vk.WholeSize)
+            {
+                rangeSize = allocSize - alignedOffset;
+            }
+            else
+            {
+                ulong unaligned = size + (offset - alignedOffset);
+                rangeSize = ((unaligned + atomSize - 1) / atomSize) * atomSize;
+                if (rangeSize > allocSize - alignedOffset)
+                    rangeSize = allocSize - alignedOffset;
+            }
+
+            ulong absOffset = alignedOffset;
+            if (!allocation.IsDedicated)
+                absOffset += allocation.Offset;
+
+            return new MappedMemoryRange
+            {
+                SType  = StructureType.MappedMemoryRange,
+                Memory = allocation.Memory,
+                Offset = absOffset,
+                Size   = rangeSize,
+            };
         }
 
         // ── Tears down all default block vectors ──────────────────────────────

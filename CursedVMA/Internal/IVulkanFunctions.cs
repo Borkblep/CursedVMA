@@ -82,6 +82,30 @@ namespace CursedVMA.Internal
             Image image,
             out MemoryRequirements memoryRequirements);
 
+        // --- Resource lifecycle ---
+
+        Result CreateBuffer(
+            Device device,
+            in BufferCreateInfo createInfo,
+            AllocationCallbacks* pAllocator,
+            out Silk.NET.Vulkan.Buffer buffer);
+
+        void DestroyBuffer(
+            Device device,
+            Silk.NET.Vulkan.Buffer buffer,
+            AllocationCallbacks* pAllocator);
+
+        Result CreateImage(
+            Device device,
+            in ImageCreateInfo createInfo,
+            AllocationCallbacks* pAllocator,
+            out Image image);
+
+        void DestroyImage(
+            Device device,
+            Image image,
+            AllocationCallbacks* pAllocator);
+
         // --- Physical device queries ---
 
         void GetPhysicalDeviceMemoryProperties(

@@ -25,9 +25,22 @@ namespace CursedVMA.Tests
         public int BindBufferMemory2CallCount;
         public int BindImageMemoryCallCount;
         public int BindImageMemory2CallCount;
+        public int CreateBufferCallCount;
+        public int DestroyBufferCallCount;
+        public int CreateImageCallCount;
+        public int DestroyImageCallCount;
+        public int FlushMappedMemoryRangesCallCount;
+        public int InvalidateMappedMemoryRangesCallCount;
+
+        // Most recent MappedMemoryRange seen by Flush/Invalidate; for assertions.
+        public MappedMemoryRange LastMappedMemoryRange;
 
         // Configurable return values for failure-path tests.
         public Result AllocateMemoryResult = Result.Success;
+        public Result CreateBufferResult   = Result.Success;
+        public Result CreateImageResult    = Result.Success;
+        public Result BindBufferMemoryResult = Result.Success;
+        public Result BindImageMemoryResult  = Result.Success;
 
         // Configurable responses for physical-device queries.
         public PhysicalDeviceMemoryProperties MemoryProperties;
@@ -38,6 +51,8 @@ namespace CursedVMA.Tests
         public MemoryRequirements ImageMemoryRequirements = default;
 
         private ulong m_NextMemoryHandle = 1;
+        private ulong m_NextBufferHandle = 1;
+        private ulong m_NextImageHandle  = 1;
 
         public Result AllocateMemory(
             Device device,
@@ -79,16 +94,29 @@ namespace CursedVMA.Tests
 
         public Result FlushMappedMemoryRanges(
             Device device, uint memoryRangeCount, MappedMemoryRange* pMemoryRanges)
-            => Result.Success;
+        {
+            FlushMappedMemoryRangesCallCount++;
+            if (memoryRangeCount > 0 && pMemoryRanges != null)
+                LastMappedMemoryRange = pMemoryRanges[0];
+            return Result.Success;
+        }
 
         public Result InvalidateMappedMemoryRanges(
             Device device, uint memoryRangeCount, MappedMemoryRange* pMemoryRanges)
-            => Result.Success;
+        {
+            InvalidateMappedMemoryRangesCallCount++;
+            if (memoryRangeCount > 0 && pMemoryRanges != null)
+                LastMappedMemoryRange = pMemoryRanges[0];
+            return Result.Success;
+        }
 
         public Result BindBufferMemory(
             Device device, Silk.NET.Vulkan.Buffer buffer,
             DeviceMemory memory, ulong memoryOffset)
-        { BindBufferMemoryCallCount++; return Result.Success; }
+        {
+            BindBufferMemoryCallCount++;
+            return BindBufferMemoryResult;
+        }
 
         public Result BindBufferMemory2(
             Device device, uint bindInfoCount, BindBufferMemoryInfo* pBindInfos)
@@ -96,11 +124,50 @@ namespace CursedVMA.Tests
 
         public Result BindImageMemory(
             Device device, Image image, DeviceMemory memory, ulong memoryOffset)
-        { BindImageMemoryCallCount++; return Result.Success; }
+        {
+            BindImageMemoryCallCount++;
+            return BindImageMemoryResult;
+        }
 
         public Result BindImageMemory2(
             Device device, uint bindInfoCount, BindImageMemoryInfo* pBindInfos)
         { BindImageMemory2CallCount++; return Result.Success; }
+
+        public Result CreateBuffer(
+            Device device, in BufferCreateInfo createInfo,
+            AllocationCallbacks* pAllocator, out Silk.NET.Vulkan.Buffer buffer)
+        {
+            CreateBufferCallCount++;
+            if (CreateBufferResult != Result.Success)
+            {
+                buffer = default;
+                return CreateBufferResult;
+            }
+            buffer = new Silk.NET.Vulkan.Buffer(m_NextBufferHandle++);
+            return Result.Success;
+        }
+
+        public void DestroyBuffer(
+            Device device, Silk.NET.Vulkan.Buffer buffer, AllocationCallbacks* pAllocator)
+            => DestroyBufferCallCount++;
+
+        public Result CreateImage(
+            Device device, in ImageCreateInfo createInfo,
+            AllocationCallbacks* pAllocator, out Image image)
+        {
+            CreateImageCallCount++;
+            if (CreateImageResult != Result.Success)
+            {
+                image = default;
+                return CreateImageResult;
+            }
+            image = new Image(m_NextImageHandle++);
+            return Result.Success;
+        }
+
+        public void DestroyImage(
+            Device device, Image image, AllocationCallbacks* pAllocator)
+            => DestroyImageCallCount++;
 
         public void GetBufferMemoryRequirements(
             Device device, Silk.NET.Vulkan.Buffer buffer, out MemoryRequirements r)

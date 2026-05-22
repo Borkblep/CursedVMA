@@ -136,5 +136,45 @@ namespace CursedVMA.Internal
             m_Vk.GetPhysicalDeviceProperties(physicalDevice, &p);
             properties = p;
         }
+
+        public Result CreateBuffer(
+            Device device,
+            in BufferCreateInfo createInfo,
+            AllocationCallbacks* pAllocator,
+            out Silk.NET.Vulkan.Buffer buffer)
+        {
+            Silk.NET.Vulkan.Buffer b = default;
+            Result r;
+            fixed (BufferCreateInfo* pInfo = &createInfo)
+                r = m_Vk.CreateBuffer(device, pInfo, pAllocator, &b);
+            buffer = b;
+            return r;
+        }
+
+        public void DestroyBuffer(
+            Device device,
+            Silk.NET.Vulkan.Buffer buffer,
+            AllocationCallbacks* pAllocator)
+            => m_Vk.DestroyBuffer(device, buffer, pAllocator);
+
+        public Result CreateImage(
+            Device device,
+            in ImageCreateInfo createInfo,
+            AllocationCallbacks* pAllocator,
+            out Image image)
+        {
+            Image i = default;
+            Result r;
+            fixed (ImageCreateInfo* pInfo = &createInfo)
+                r = m_Vk.CreateImage(device, pInfo, pAllocator, &i);
+            image = i;
+            return r;
+        }
+
+        public void DestroyImage(
+            Device device,
+            Image image,
+            AllocationCallbacks* pAllocator)
+            => m_Vk.DestroyImage(device, image, pAllocator);
     }
 }

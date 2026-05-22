@@ -90,8 +90,24 @@ namespace CursedVMA
         internal VmaBlockVector OwningBlockVector => m_OwningBlockVector;
         internal VmaDeviceMemoryBlock Block => m_Block;
         internal ulong AllocHandle => m_AllocHandle;
+        internal ulong Alignment => m_Alignment;
         internal int MapCount => m_MapCount;
         internal unsafe void* MappedData => (void*)m_pMappedData;
+
+        // Defrag: repoint this allocation to a new block location. The caller
+        // must capture the old block/handle BEFORE calling this, then free them.
+        internal void SwapToBlock(
+            VmaBlockVector newBv,
+            VmaDeviceMemoryBlock newBlock,
+            ulong newHandle,
+            ulong newOffset)
+        {
+            m_OwningBlockVector = newBv;
+            m_Block             = newBlock;
+            m_AllocHandle       = newHandle;
+            m_Offset            = newOffset;
+            m_pMappedData       = 0;
+        }
 
         /// <summary>
         /// Reference-counted map. Routes to <c>VmaDeviceMemoryBlock.Map</c> for

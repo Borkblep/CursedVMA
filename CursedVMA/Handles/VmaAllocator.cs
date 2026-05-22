@@ -1162,6 +1162,74 @@ namespace CursedVMA
             };
         }
 
+        // ── Phase 14: defragmentation ────────────────────────────────────────
+
+        /// <summary>
+        /// Starts a defragmentation session. Each pass is executed by calling
+        /// <see cref="BeginDefragmentationPass"/> / <see cref="EndDefragmentationPass"/>
+        /// in a loop until <see cref="EndDefragmentationPass"/> returns 0 moves.
+        /// Finish with <see cref="EndDefragmentation"/>. Equivalent to
+        /// <c>vmaBeginDefragmentation</c>.
+        /// </summary>
+        public Result BeginDefragmentation(
+            in VmaDefragmentationInfo defragmentationInfo,
+            out VmaDefragmentationContext context)
+        {
+            RequireNotDisposed();
+            context = new VmaDefragmentationContext(this, in defragmentationInfo);
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Ends a defragmentation session, collects accumulated statistics into
+        /// <paramref name="defragmentationStats"/>, and disposes the context.
+        /// Equivalent to <c>vmaEndDefragmentation</c>.
+        /// </summary>
+        public void EndDefragmentation(
+            VmaDefragmentationContext context,
+            out VmaDefragmentationStats defragmentationStats)
+        {
+            RequireNotDisposed();
+            context.GetStats(out defragmentationStats);
+            context.Dispose();
+        }
+
+        /// <summary>
+        /// Plans the next defragmentation pass: selects the emptiest non-empty
+        /// block, attempts to fit each of its (unmapped) allocations into other
+        /// existing blocks, and returns the proposed move list in
+        /// <paramref name="passInfo"/>. The caller should copy data between each
+        /// <see cref="VmaDefragmentationMove.SrcAllocation"/> and
+        /// <see cref="VmaDefragmentationMove.DstTmpAllocation"/>, then mark the
+        /// <see cref="VmaDefragmentationMove.Operation"/> accordingly before
+        /// calling <see cref="EndDefragmentationPass"/>. Equivalent to
+        /// <c>vmaBeginDefragmentationPass</c>.
+        /// </summary>
+        public Result BeginDefragmentationPass(
+            VmaDefragmentationContext context,
+            out VmaDefragmentationPassMoveInfo passInfo)
+        {
+            RequireNotDisposed();
+            return context.BeginPass(out passInfo);
+        }
+
+        /// <summary>
+        /// Applies the caller's decisions from a defragmentation pass.
+        /// <see cref="VmaDefragmentationMoveOperation.Copy"/> swaps the source
+        /// allocation to the destination location and frees the old slot;
+        /// <see cref="VmaDefragmentationMoveOperation.Ignore"/> releases the
+        /// reserved temporary allocation; <see cref="VmaDefragmentationMoveOperation.Destroy"/>
+        /// frees both the source slot and the temporary allocation. Equivalent
+        /// to <c>vmaEndDefragmentationPass</c>.
+        /// </summary>
+        public Result EndDefragmentationPass(
+            VmaDefragmentationContext context,
+            ref VmaDefragmentationPassMoveInfo passInfo)
+        {
+            RequireNotDisposed();
+            return context.EndPass(ref passInfo);
+        }
+
         // ── Tears down all default block vectors ──────────────────────────────
 
         /// <summary>

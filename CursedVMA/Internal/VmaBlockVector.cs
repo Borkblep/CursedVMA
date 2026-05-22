@@ -252,10 +252,80 @@ namespace CursedVMA.Internal
                 ulong offset = block.Metadata.GetAllocationOffset(request.AllocHandle);
                 allocation = VmaAllocation.CreateBlockAllocation(
                     this, block, request.AllocHandle, offset, size, alignment, m_MemoryTypeIndex);
+                // Store back-reference so defrag can recover the VmaAllocation from metadata.
+                block.Metadata.SetAllocationUserData(request.AllocHandle, allocation);
                 return true;
             }
             allocation = null;
             return false;
+        }
+
+        // ── Defragmentation helpers ───────────────────────────────────────────
+
+        /// <summary>
+        /// Tries to fit an allocation of <paramref name="size"/> /
+        /// <paramref name="alignment"/> in any existing block other than
+        /// <paramref name="excludeBlock"/>. No new blocks are created.
+        /// Returns true and fills <paramref name="allocation"/> on success.
+        /// </summary>
+        internal bool TryAllocateInExistingBlocks(
+            ulong size,
+            ulong alignment,
+            VmaSuballocationType suballocType,
+            VmaDeviceMemoryBlock excludeBlock,
+            out VmaAllocation? allocation)
+        {
+            allocation = null;
+            ulong effectiveAlignment = Math.Max(alignment, m_MinAllocationAlignment);
+            lock (m_MutexLock)
+            {
+                foreach (var block in m_Blocks)
+                {
+                    if (block == excludeBlock) continue;
+                    if (TryAllocFromBlock(block, size, effectiveAlignment,
+                            upperAddress: false, suballocType, strategy: 0, out allocation))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Frees <paramref name="allocHandle"/> from <paramref name="block"/>'s
+        /// metadata. If the block is now empty and the vector is above its
+        /// minimum count, destroys and removes the block and returns its size
+        /// (in bytes); otherwise returns 0.
+        /// </summary>
+        internal unsafe ulong FreeAllocationFromBlock(
+            VmaDeviceMemoryBlock block, ulong allocHandle)
+        {
+            lock (m_MutexLock)
+            {
+                block.Metadata.Free(allocHandle);
+
+                if ((nuint)m_Blocks.Count > m_MinBlockCount && block.IsEmpty())
+                {
+                    AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
+                    AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
+                    ulong blockSize = block.Metadata.GetSize();
+                    block.Destroy(m_VkFunctions, m_Device, pAc);
+                    m_Blocks.Remove(block);
+                    return blockSize;
+                }
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Updates the back-reference stored in <paramref name="block"/>'s
+        /// metadata for <paramref name="handle"/> under the vector's lock.
+        /// Used by defrag EndPass after a Copy swap.
+        /// </summary>
+        internal void UpdateAllocationUserData(
+            VmaDeviceMemoryBlock block, ulong handle, object? userData)
+        {
+            lock (m_MutexLock)
+                block.Metadata.SetAllocationUserData(handle, userData);
         }
 
         /// <summary>

@@ -69,6 +69,9 @@ namespace CursedVMA
         // every vkFreeMemory. Mirrors VmaDeviceMemoryCallbacks in C++ VMA.
         private readonly VmaDeviceMemoryCallbacks? m_DeviceMemoryCallbacks;
 
+        // Current frame index used for budget tracking and block-trim heuristics.
+        private volatile uint m_CurrentFrameIndex;
+
         private bool m_IsDisposed;
 
         private VmaAllocator(
@@ -723,7 +726,7 @@ namespace CursedVMA
         /// <paramref name="outBudgets"/> should have at least
         /// <see cref="MemoryHeapCount"/> entries; extra entries are zeroed.
         /// </summary>
-        public void GetHeapBudgets(Span<VmaBudget> outBudgets)
+        public unsafe void GetHeapBudgets(Span<VmaBudget> outBudgets)
         {
             RequireNotDisposed();
             outBudgets.Clear();
@@ -732,30 +735,70 @@ namespace CursedVMA
             GetStatistics(typeStats);
 
             uint heapCount = Math.Min((uint)outBudgets.Length, MemoryProperties.MemoryHeapCount);
-            for (uint heapIndex = 0; heapIndex < heapCount; heapIndex++)
+
+            if ((Flags & VmaAllocatorCreateFlags.ExtMemoryBudgetBit) != 0)
             {
-                outBudgets[(int)heapIndex] = default;
-
-                for (uint typeIndex = 0; typeIndex < MemoryTypeCount; typeIndex++)
+                // Query the real per-heap budget and usage from the driver.
+                var budgetProps = new PhysicalDeviceMemoryBudgetPropertiesEXT
                 {
-                    if (GetMemoryType(typeIndex).HeapIndex == heapIndex)
-                    {
-                        VmaStatisticsHelper.MergeStatistics(
-                            ref outBudgets[(int)heapIndex].Statistics,
-                            in typeStats[(int)typeIndex]);
-                    }
-                }
+                    SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt,
+                };
+                var memProps2 = new PhysicalDeviceMemoryProperties2
+                {
+                    SType = StructureType.PhysicalDeviceMemoryProperties2,
+                    PNext = &budgetProps,
+                };
+                VkFunctions.GetPhysicalDeviceMemoryProperties2(PhysicalDevice, ref memProps2);
 
-                ulong heapSize = GetMemoryHeap(heapIndex).Size;
-                outBudgets[(int)heapIndex].Usage   = outBudgets[(int)heapIndex].Statistics.BlockBytes;
-                outBudgets[(int)heapIndex].Budget  = heapSize * 8 / 10;
+                for (uint heapIndex = 0; heapIndex < heapCount; heapIndex++)
+                {
+                    for (uint typeIndex = 0; typeIndex < MemoryTypeCount; typeIndex++)
+                    {
+                        if (GetMemoryType(typeIndex).HeapIndex == heapIndex)
+                            VmaStatisticsHelper.MergeStatistics(
+                                ref outBudgets[(int)heapIndex].Statistics,
+                                in typeStats[(int)typeIndex]);
+                    }
+
+                    outBudgets[(int)heapIndex].Usage   = budgetProps.HeapUsage[(int)heapIndex];
+                    outBudgets[(int)heapIndex].Budget  = budgetProps.HeapBudget[(int)heapIndex];
+                }
+            }
+            else
+            {
+                for (uint heapIndex = 0; heapIndex < heapCount; heapIndex++)
+                {
+                    for (uint typeIndex = 0; typeIndex < MemoryTypeCount; typeIndex++)
+                    {
+                        if (GetMemoryType(typeIndex).HeapIndex == heapIndex)
+                            VmaStatisticsHelper.MergeStatistics(
+                                ref outBudgets[(int)heapIndex].Statistics,
+                                in typeStats[(int)typeIndex]);
+                    }
+
+                    ulong heapSize = GetMemoryHeap(heapIndex).Size;
+                    outBudgets[(int)heapIndex].Usage   = outBudgets[(int)heapIndex].Statistics.BlockBytes;
+                    outBudgets[(int)heapIndex].Budget  = heapSize * 8 / 10;
+                }
             }
         }
 
         // ── Phase 12: allocator info + JSON statistics dump ──────────────────
 
         /// <summary>
-        /// Returns a snapshot of the Vulkan handles this allocator was created
+        /// Advances the internal frame counter used by block-trim heuristics and
+        /// <c>VK_EXT_memory_budget</c> refresh. Must be called once per rendered
+        /// frame when either of those features is in use. Equivalent to
+        /// <c>vmaSetCurrentFrameIndex</c>.
+        /// </summary>
+        public void SetCurrentFrameIndex(uint frameIndex)
+        {
+            RequireNotDisposed();
+            m_CurrentFrameIndex = frameIndex;
+        }
+
+        /// <summary>
+        /// Returns the snapshot of the Vulkan handles this allocator was created
         /// with. Equivalent to <c>vmaGetAllocatorInfo</c>.
         /// </summary>
         public void GetAllocatorInfo(out VmaAllocatorInfo info)
@@ -768,6 +811,9 @@ namespace CursedVMA
                 Device         = Device,
             };
         }
+
+        // Exposed for testing; not part of the public VMA API.
+        internal uint CurrentFrameIndex => m_CurrentFrameIndex;
 
         /// <summary>
         /// Builds a JSON string describing the allocator's state — general

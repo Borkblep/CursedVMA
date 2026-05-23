@@ -5,6 +5,7 @@
 
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
+using System.Runtime.CompilerServices;
 
 namespace CursedVMA.Internal
 {
@@ -136,6 +137,13 @@ namespace CursedVMA.Internal
             m_Vk.GetPhysicalDeviceProperties(physicalDevice, &p);
             properties = p;
         }
+
+        public unsafe void GetPhysicalDeviceMemoryProperties2(
+            PhysicalDevice physicalDevice,
+            ref PhysicalDeviceMemoryProperties2 memoryProperties2)
+            => m_Vk.GetPhysicalDeviceMemoryProperties2(
+                physicalDevice,
+                (PhysicalDeviceMemoryProperties2*)Unsafe.AsPointer(ref memoryProperties2));
 
         public Result CreateBuffer(
             Device device,

@@ -191,5 +191,38 @@ namespace CursedVMA.Tests
         public void GetPhysicalDeviceProperties(
             PhysicalDevice pd, out PhysicalDeviceProperties r)
             => r = DeviceProperties;
+
+        // Configurable budget data returned when the caller chains
+        // PhysicalDeviceMemoryBudgetPropertiesEXT into the pNext.
+        public PhysicalDeviceMemoryBudgetPropertiesEXT FakeBudgetProperties = default;
+
+        public int GetPhysicalDeviceMemoryProperties2CallCount;
+
+        public unsafe void GetPhysicalDeviceMemoryProperties2(
+            PhysicalDevice pd,
+            ref PhysicalDeviceMemoryProperties2 memoryProperties2)
+        {
+            GetPhysicalDeviceMemoryProperties2CallCount++;
+            memoryProperties2.MemoryProperties = MemoryProperties;
+
+            // Walk the pNext chain and fill any PhysicalDeviceMemoryBudgetPropertiesEXT.
+            void* pNext = memoryProperties2.PNext;
+            while (pNext != null)
+            {
+                if (*(StructureType*)pNext == StructureType.PhysicalDeviceMemoryBudgetPropertiesExt)
+                {
+                    var budgetPtr = (PhysicalDeviceMemoryBudgetPropertiesEXT*)pNext;
+                    // Preserve the caller's pNext chain pointer, then overwrite the struct.
+                    void* savedNext = budgetPtr->PNext;
+                    *budgetPtr = FakeBudgetProperties;
+                    budgetPtr->SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt;
+                    budgetPtr->PNext = savedNext;
+                    break;
+                }
+                // PNext field is at byte offset 8 on 64-bit platforms
+                // (4-byte SType enum + 4 bytes natural alignment padding).
+                pNext = *(void**)((byte*)pNext + 8);
+            }
+        }
     }
 }

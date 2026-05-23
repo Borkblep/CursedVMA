@@ -115,5 +115,9 @@ namespace CursedVMA.Internal
         void GetPhysicalDeviceProperties(
             PhysicalDevice physicalDevice,
             out PhysicalDeviceProperties properties);
+
+        void GetPhysicalDeviceMemoryProperties2(
+            PhysicalDevice physicalDevice,
+            ref PhysicalDeviceMemoryProperties2 memoryProperties2);
     }
 }

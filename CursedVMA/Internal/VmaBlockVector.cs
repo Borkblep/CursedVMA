@@ -27,6 +27,10 @@ namespace CursedVMA.Internal
         // The pointed-to memory must remain valid for the lifetime of the block vector.
         private readonly nint m_pMemoryAllocateNext;
 
+        // Owning allocator; null in standalone tests. Used for heap-size-limit
+        // tracking around vkAllocateMemory / vkFreeMemory.
+        private readonly VmaAllocator? m_Allocator;
+
         private readonly List<VmaDeviceMemoryBlock> m_Blocks = new List<VmaDeviceMemoryBlock>();
         private uint m_NextBlockId;
         private readonly object m_MutexLock = new object();
@@ -43,7 +47,8 @@ namespace CursedVMA.Internal
             VmaPoolCreateFlags algorithm,
             bool explicitBlockSize,
             ulong minAllocationAlignment,
-            nint pMemoryAllocateNext = 0)
+            nint pMemoryAllocateNext = 0,
+            VmaAllocator? allocator = null)
         {
             m_VkFunctions = vkFunctions;
             m_Device = device;
@@ -57,6 +62,7 @@ namespace CursedVMA.Internal
             m_ExplicitBlockSize = explicitBlockSize;
             m_MinAllocationAlignment = minAllocationAlignment;
             m_pMemoryAllocateNext = pMemoryAllocateNext;
+            m_Allocator = allocator;
         }
 
         internal uint MemoryTypeIndex => m_MemoryTypeIndex;
@@ -109,6 +115,11 @@ namespace CursedVMA.Internal
                 blockId = m_NextBlockId++;
             }
 
+            // Heap-size-limit gate (no-op when allocator isn't tracking).
+            if (m_Allocator != null
+                && !m_Allocator.TryReserveHeapBytes(m_MemoryTypeIndex, blockSize))
+                return Result.ErrorOutOfDeviceMemory;
+
             AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
 
@@ -120,7 +131,10 @@ namespace CursedVMA.Internal
                 m_pMemoryAllocateNext);
 
             if (r != Result.Success)
+            {
+                m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, blockSize);
                 return r;
+            }
 
             lock (m_MutexLock)
             {
@@ -148,8 +162,10 @@ namespace CursedVMA.Internal
                     {
                         AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
                         AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
+                        ulong size = m_Blocks[i].Metadata.GetSize();
                         m_Blocks[i].Destroy(m_VkFunctions, m_Device, pAc);
                         m_Blocks.RemoveAt(i);
+                        m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, size);
                     }
                 }
             }
@@ -168,7 +184,11 @@ namespace CursedVMA.Internal
                 AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
 
                 foreach (var block in m_Blocks)
+                {
+                    ulong size = block.Metadata.GetSize();
                     block.Destroy(m_VkFunctions, m_Device, pAc);
+                    m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, size);
+                }
                 m_Blocks.Clear();
             }
         }
@@ -299,6 +319,7 @@ namespace CursedVMA.Internal
         internal unsafe ulong FreeAllocationFromBlock(
             VmaDeviceMemoryBlock block, ulong allocHandle)
         {
+            ulong releasedBlockSize = 0;
             lock (m_MutexLock)
             {
                 block.Metadata.Free(allocHandle);
@@ -307,13 +328,14 @@ namespace CursedVMA.Internal
                 {
                     AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
                     AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
-                    ulong blockSize = block.Metadata.GetSize();
+                    releasedBlockSize = block.Metadata.GetSize();
                     block.Destroy(m_VkFunctions, m_Device, pAc);
                     m_Blocks.Remove(block);
-                    return blockSize;
                 }
-                return 0;
             }
+            if (releasedBlockSize > 0)
+                m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, releasedBlockSize);
+            return releasedBlockSize;
         }
 
         /// <summary>
@@ -336,6 +358,7 @@ namespace CursedVMA.Internal
         internal unsafe void Free(VmaAllocation allocation)
         {
             var block = allocation.Block;
+            ulong releasedBlockSize = 0;
             lock (m_MutexLock)
             {
                 block.Metadata.Free(allocation.AllocHandle);
@@ -344,10 +367,13 @@ namespace CursedVMA.Internal
                 {
                     AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
                     AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
+                    releasedBlockSize = block.Metadata.GetSize();
                     block.Destroy(m_VkFunctions, m_Device, pAc);
                     m_Blocks.Remove(block);
                 }
             }
+            if (releasedBlockSize > 0)
+                m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, releasedBlockSize);
         }
 
         /// <summary>

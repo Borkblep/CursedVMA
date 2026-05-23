@@ -40,5 +40,11 @@ namespace CursedVMA
         /// <see cref="VmaAllocatorCreateFlags.ExtMemoryPriorityBit"/> is set on
         /// the allocator. Range 0.0f (low) .. 1.0f (high).</summary>
         public float Priority;
+
+        /// <summary>Minimum alignment, in bytes, that the resulting allocation
+        /// offset must satisfy. The effective alignment is the larger of this
+        /// value and the resource's reported <c>memoryRequirements.alignment</c>.
+        /// Zero means no extra constraint. Equivalent to <c>minAlignment</c>.</summary>
+        public ulong MinAlignment;
     }
 }

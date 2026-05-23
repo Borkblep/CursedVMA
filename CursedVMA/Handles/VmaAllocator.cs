@@ -15,6 +15,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace CursedVMA
 {
@@ -55,6 +56,11 @@ namespace CursedVMA
             new List<VmaAllocation>();
         private readonly object m_DedicatedMutex = new object();
 
+        // Per-heap byte counters (signed for Interlocked.Add) and effective
+        // size limits (real VK heap size capped by VmaAllocatorCreateInfo.HeapSizeLimit).
+        private readonly long[] m_HeapBytes;
+        private readonly ulong[] m_HeapSizeLimit;
+
         private bool m_IsDisposed;
 
         private VmaAllocator(
@@ -67,7 +73,8 @@ namespace CursedVMA
             PhysicalDeviceMemoryProperties memoryProperties,
             PhysicalDeviceLimits deviceLimits,
             uint vulkanApiVersion,
-            ulong preferredLargeHeapBlockSize)
+            ulong preferredLargeHeapBlockSize,
+            ulong[]? heapSizeLimit)
         {
             VkFunctions = vkFunctions;
             Flags = flags;
@@ -79,6 +86,19 @@ namespace CursedVMA
             DeviceLimits = deviceLimits;
             VulkanApiVersion = vulkanApiVersion;
             PreferredLargeHeapBlockSize = preferredLargeHeapBlockSize;
+
+            uint heapCount = memoryProperties.MemoryHeapCount;
+            m_HeapBytes     = new long[heapCount];
+            m_HeapSizeLimit = new ulong[heapCount];
+            for (uint h = 0; h < heapCount; h++)
+            {
+                ulong real  = memoryProperties.MemoryHeaps[(int)h].Size;
+                ulong limit = heapSizeLimit != null && h < heapSizeLimit.Length
+                                && heapSizeLimit[h] != 0
+                              ? heapSizeLimit[h]
+                              : ulong.MaxValue;
+                m_HeapSizeLimit[h] = Math.Min(real, limit);
+            }
         }
 
         /// <summary>
@@ -147,12 +167,13 @@ namespace CursedVMA
                 memProps,
                 devProps.Limits,
                 createInfo.VulkanApiVersion,
-                preferredLargeBlockSize);
+                preferredLargeBlockSize,
+                createInfo.HeapSizeLimit);
 
             for (uint i = 0; i < memProps.MemoryTypeCount; i++)
             {
                 uint heapIndex = memProps.MemoryTypes[(int)i].HeapIndex;
-                ulong heapSize = memProps.MemoryHeaps[(int)heapIndex].Size;
+                ulong heapSize = inst.m_HeapSizeLimit[heapIndex];
                 ulong blockSize = CalcPreferredBlockSize(heapSize, preferredLargeBlockSize);
 
                 inst.m_pBlockVectors[i] = new VmaBlockVector(
@@ -166,7 +187,9 @@ namespace CursedVMA
                     bufferImageGranularity: bufferImageGranularity,
                     algorithm: VmaPoolCreateFlags.None,
                     explicitBlockSize: false,
-                    minAllocationAlignment: 1);
+                    minAllocationAlignment: 1,
+                    pMemoryAllocateNext: 0,
+                    allocator: inst);
 
                 Result r = inst.m_pBlockVectors[i]!.Init();
                 if (r != Result.Success)
@@ -211,7 +234,7 @@ namespace CursedVMA
             else
             {
                 uint heapIndex = GetMemoryType(createInfo.MemoryTypeIndex).HeapIndex;
-                ulong heapSize = GetMemoryHeap(heapIndex).Size;
+                ulong heapSize = m_HeapSizeLimit[heapIndex];
                 blockSize = CalcPreferredBlockSize(heapSize, PreferredLargeHeapBlockSize);
                 explicitBlockSize = false;
             }
@@ -240,7 +263,8 @@ namespace CursedVMA
                 createInfo.Flags & VmaPoolCreateFlags.AlgorithmMask,
                 explicitBlockSize,
                 minAllocationAlignment,
-                (nint)createInfo.MemoryAllocateNext);
+                (nint)createInfo.MemoryAllocateNext,
+                allocator: this);
 
             Result r = blockVector.Init();
             if (r != Result.Success)
@@ -330,6 +354,66 @@ namespace CursedVMA
             return memoryTypeIndex != uint.MaxValue
                 ? Result.Success
                 : Result.ErrorFeatureNotPresent;
+        }
+
+        /// <summary>
+        /// Selects a memory type index suitable for an as-yet-uncreated buffer
+        /// described by <paramref name="bufferCreateInfo"/>. Internally creates
+        /// a throwaway <c>VkBuffer</c> just to query its memory requirements,
+        /// then destroys it. Equivalent to
+        /// <c>vmaFindMemoryTypeIndexForBufferInfo</c>.
+        /// </summary>
+        public unsafe Result FindMemoryTypeIndexForBufferInfo(
+            in BufferCreateInfo bufferCreateInfo,
+            in VmaAllocationCreateInfo allocationCreateInfo,
+            out uint memoryTypeIndex)
+        {
+            RequireNotDisposed();
+            memoryTypeIndex = uint.MaxValue;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateBuffer(
+                Device, in bufferCreateInfo, pAc, out Silk.NET.Vulkan.Buffer probe);
+            if (r != Result.Success)
+                return r;
+
+            VkFunctions.GetBufferMemoryRequirements(Device, probe, out MemoryRequirements req);
+            VkFunctions.DestroyBuffer(Device, probe, pAc);
+
+            return FindMemoryTypeIndex(
+                req.MemoryTypeBits, in allocationCreateInfo, out memoryTypeIndex);
+        }
+
+        /// <summary>
+        /// Selects a memory type index suitable for an as-yet-uncreated image
+        /// described by <paramref name="imageCreateInfo"/>. Internally creates
+        /// a throwaway <c>VkImage</c> just to query its memory requirements,
+        /// then destroys it. Equivalent to
+        /// <c>vmaFindMemoryTypeIndexForImageInfo</c>.
+        /// </summary>
+        public unsafe Result FindMemoryTypeIndexForImageInfo(
+            in ImageCreateInfo imageCreateInfo,
+            in VmaAllocationCreateInfo allocationCreateInfo,
+            out uint memoryTypeIndex)
+        {
+            RequireNotDisposed();
+            memoryTypeIndex = uint.MaxValue;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateImage(
+                Device, in imageCreateInfo, pAc, out Image probe);
+            if (r != Result.Success)
+                return r;
+
+            VkFunctions.GetImageMemoryRequirements(Device, probe, out MemoryRequirements req);
+            VkFunctions.DestroyImage(Device, probe, pAc);
+
+            return FindMemoryTypeIndex(
+                req.MemoryTypeBits, in allocationCreateInfo, out memoryTypeIndex);
         }
 
         /// <summary>
@@ -934,14 +1018,18 @@ namespace CursedVMA
                 return r;
             }
 
-            r = BindBufferMemory(allocation!, buffer);
-            if (r != Result.Success)
+            // Honor DontBindBit: caller will bind the buffer manually.
+            if ((allocationCreateInfo.Flags & VmaAllocationCreateFlags.DontBindBit) == 0)
             {
-                FreeMemory(allocation);
-                VkFunctions.DestroyBuffer(Device, buffer, pAc);
-                buffer     = default;
-                allocation = null;
-                return r;
+                r = BindBufferMemory(allocation!, buffer);
+                if (r != Result.Success)
+                {
+                    FreeMemory(allocation);
+                    VkFunctions.DestroyBuffer(Device, buffer, pAc);
+                    buffer     = default;
+                    allocation = null;
+                    return r;
+                }
             }
 
             allocation!.GetInfo(out allocationInfo);
@@ -998,14 +1086,18 @@ namespace CursedVMA
                 return r;
             }
 
-            r = BindImageMemory(allocation!, image);
-            if (r != Result.Success)
+            // Honor DontBindBit: caller will bind the image manually.
+            if ((allocationCreateInfo.Flags & VmaAllocationCreateFlags.DontBindBit) == 0)
             {
-                FreeMemory(allocation);
-                VkFunctions.DestroyImage(Device, image, pAc);
-                image      = default;
-                allocation = null;
-                return r;
+                r = BindImageMemory(allocation!, image);
+                if (r != Result.Success)
+                {
+                    FreeMemory(allocation);
+                    VkFunctions.DestroyImage(Device, image, pAc);
+                    image      = default;
+                    allocation = null;
+                    return r;
+                }
             }
 
             allocation!.GetInfo(out allocationInfo);
@@ -1252,7 +1344,10 @@ namespace CursedVMA
                     AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
                     AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
                     foreach (var alloc in m_DedicatedAllocations)
+                    {
                         VkFunctions.FreeMemory(Device, alloc.DedicatedMemory, pAc);
+                        ReleaseHeapBytes(alloc.MemoryTypeIndex, alloc.Size);
+                    }
                     m_DedicatedAllocations.Clear();
                 }
             }
@@ -1296,12 +1391,16 @@ namespace CursedVMA
         {
             allocation = null;
 
+            // Effective alignment: caller's MinAlignment hint vs. the
+            // resource's required alignment; the larger wins.
+            ulong alignment = Math.Max(vkMemReq.Alignment, createInfo.MinAlignment);
+
             // Pool path: skip type selection, use the pool's block vector.
             // DedicatedMemoryBit is invalid here per VMA's contract; ignored.
             if (createInfo.Pool != null)
             {
                 Result pr = createInfo.Pool.BlockVector.AllocatePage(
-                    vkMemReq.Size, vkMemReq.Alignment,
+                    vkMemReq.Size, alignment,
                     createInfo.Flags, suballocType, out allocation);
                 if (pr != Result.Success)
                     return pr;
@@ -1318,7 +1417,7 @@ namespace CursedVMA
             if ((createInfo.Flags & VmaAllocationCreateFlags.DedicatedMemoryBit) != 0)
             {
                 r = AllocateDedicatedMemory(memTypeIndex, vkMemReq.Size,
-                    vkMemReq.Alignment, out allocation);
+                    alignment, out allocation);
                 if (r != Result.Success)
                     return r;
                 return FinishAllocation(allocation!, in createInfo);
@@ -1329,7 +1428,7 @@ namespace CursedVMA
                 return Result.ErrorInitializationFailed;
 
             r = blockVector.AllocatePage(
-                vkMemReq.Size, vkMemReq.Alignment,
+                vkMemReq.Size, alignment,
                 createInfo.Flags, suballocType, out allocation);
             if (r != Result.Success)
                 return r;
@@ -1347,6 +1446,9 @@ namespace CursedVMA
             if (size == 0)
                 return Result.ErrorInitializationFailed;
 
+            if (!TryReserveHeapBytes(memoryTypeIndex, size))
+                return Result.ErrorOutOfDeviceMemory;
+
             AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
 
@@ -1360,7 +1462,10 @@ namespace CursedVMA
             Result r = VkFunctions.AllocateMemory(
                 Device, in allocInfo, pAc, out DeviceMemory memory);
             if (r != Result.Success)
+            {
+                ReleaseHeapBytes(memoryTypeIndex, size);
                 return r;
+            }
 
             allocation = VmaAllocation.CreateDedicatedAllocation(
                 memory, size, alignment, memoryTypeIndex);
@@ -1379,6 +1484,38 @@ namespace CursedVMA
             AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
             VkFunctions.FreeMemory(Device, allocation.DedicatedMemory, pAc);
+            ReleaseHeapBytes(allocation.MemoryTypeIndex, allocation.Size);
+        }
+
+        // ── Heap-size-limit accounting ───────────────────────────────────────
+
+        /// <summary>
+        /// Attempt to reserve <paramref name="size"/> bytes against the heap
+        /// backing memory type <paramref name="memoryTypeIndex"/>. Returns
+        /// false (without modifying the counter) if the reservation would
+        /// exceed the effective heap size limit. Used by
+        /// <see cref="VmaBlockVector"/> and the dedicated-allocation path.
+        /// </summary>
+        internal bool TryReserveHeapBytes(uint memoryTypeIndex, ulong size)
+        {
+            uint heapIndex = GetMemoryType(memoryTypeIndex).HeapIndex;
+            long after = Interlocked.Add(ref m_HeapBytes[heapIndex], (long)size);
+            if ((ulong)after > m_HeapSizeLimit[heapIndex])
+            {
+                Interlocked.Add(ref m_HeapBytes[heapIndex], -(long)size);
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Release a previously reserved <paramref name="size"/> bytes from the
+        /// heap counter for <paramref name="memoryTypeIndex"/>'s heap.
+        /// </summary>
+        internal void ReleaseHeapBytes(uint memoryTypeIndex, ulong size)
+        {
+            uint heapIndex = GetMemoryType(memoryTypeIndex).HeapIndex;
+            Interlocked.Add(ref m_HeapBytes[heapIndex], -(long)size);
         }
 
         internal int DedicatedAllocationCount

@@ -28,8 +28,12 @@ namespace CursedVMA.Internal
         private readonly nint m_pMemoryAllocateNext;
 
         // Owning allocator; null in standalone tests. Used for heap-size-limit
-        // tracking around vkAllocateMemory / vkFreeMemory.
+        // tracking, pNext chain building, and device-memory callback dispatch.
         private readonly VmaAllocator? m_Allocator;
+
+        // Priority hint forwarded to VkMemoryPriorityAllocateInfoEXT when the
+        // allocator was created with ExtMemoryPriorityBit.
+        private readonly float m_Priority;
 
         private readonly List<VmaDeviceMemoryBlock> m_Blocks = new List<VmaDeviceMemoryBlock>();
         private uint m_NextBlockId;
@@ -48,7 +52,8 @@ namespace CursedVMA.Internal
             bool explicitBlockSize,
             ulong minAllocationAlignment,
             nint pMemoryAllocateNext = 0,
-            VmaAllocator? allocator = null)
+            VmaAllocator? allocator = null,
+            float priority = 0.5f)
         {
             m_VkFunctions = vkFunctions;
             m_Device = device;
@@ -63,6 +68,7 @@ namespace CursedVMA.Internal
             m_MinAllocationAlignment = minAllocationAlignment;
             m_pMemoryAllocateNext = pMemoryAllocateNext;
             m_Allocator = allocator;
+            m_Priority = priority;
         }
 
         internal uint MemoryTypeIndex => m_MemoryTypeIndex;
@@ -123,12 +129,43 @@ namespace CursedVMA.Internal
             AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
 
+            // Build pNext chain: MemoryAllocateFlagsInfo (device address) and
+            // MemoryPriorityAllocateInfoEXT, each pointing to the next in line,
+            // with the user's m_pMemoryAllocateNext at the tail.
+            nint pNextChain = m_pMemoryAllocateNext;
+
+            MemoryAllocateFlagsInfo flagsInfo = default;
+            if (m_Allocator != null
+                && (m_Allocator.Flags & VmaAllocatorCreateFlags.BufferDeviceAddressBit) != 0)
+            {
+                flagsInfo = new MemoryAllocateFlagsInfo
+                {
+                    SType  = StructureType.MemoryAllocateFlagsInfo,
+                    PNext  = (void*)pNextChain,
+                    Flags  = MemoryAllocateFlags.AddressBit,
+                };
+                pNextChain = (nint)(&flagsInfo);
+            }
+
+            MemoryPriorityAllocateInfoEXT priorityInfo = default;
+            if (m_Allocator != null
+                && (m_Allocator.Flags & VmaAllocatorCreateFlags.ExtMemoryPriorityBit) != 0)
+            {
+                priorityInfo = new MemoryPriorityAllocateInfoEXT
+                {
+                    SType    = StructureType.MemoryPriorityAllocateInfoExt,
+                    PNext    = (void*)pNextChain,
+                    Priority = m_Priority,
+                };
+                pNextChain = (nint)(&priorityInfo);
+            }
+
             Result r = VmaDeviceMemoryBlock.Create(
                 m_VkFunctions, m_Device, pAc,
                 m_MemoryTypeIndex, blockSize, blockId,
                 m_Algorithm, m_BufferImageGranularity,
                 out VmaDeviceMemoryBlock? block,
-                m_pMemoryAllocateNext);
+                pNextChain);
 
             if (r != Result.Success)
             {
@@ -141,6 +178,7 @@ namespace CursedVMA.Internal
                 m_Blocks.Add(block!);
                 newBlockIndex = m_Blocks.Count - 1;
             }
+            m_Allocator?.NotifyDeviceMemoryAllocated(m_MemoryTypeIndex, block!.Memory, blockSize);
             return Result.Success;
         }
 
@@ -163,6 +201,8 @@ namespace CursedVMA.Internal
                         AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
                         AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
                         ulong size = m_Blocks[i].Metadata.GetSize();
+                        DeviceMemory blockMemory = m_Blocks[i].Memory;
+                        m_Allocator?.NotifyDeviceMemoryFreed(m_MemoryTypeIndex, blockMemory, size);
                         m_Blocks[i].Destroy(m_VkFunctions, m_Device, pAc);
                         m_Blocks.RemoveAt(i);
                         m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, size);
@@ -186,6 +226,8 @@ namespace CursedVMA.Internal
                 foreach (var block in m_Blocks)
                 {
                     ulong size = block.Metadata.GetSize();
+                    DeviceMemory blockMemory = block.Memory;
+                    m_Allocator?.NotifyDeviceMemoryFreed(m_MemoryTypeIndex, blockMemory, size);
                     block.Destroy(m_VkFunctions, m_Device, pAc);
                     m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, size);
                 }
@@ -319,6 +361,7 @@ namespace CursedVMA.Internal
         internal unsafe ulong FreeAllocationFromBlock(
             VmaDeviceMemoryBlock block, ulong allocHandle)
         {
+            DeviceMemory releasedBlockMemory = default;
             ulong releasedBlockSize = 0;
             lock (m_MutexLock)
             {
@@ -328,7 +371,9 @@ namespace CursedVMA.Internal
                 {
                     AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
                     AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
-                    releasedBlockSize = block.Metadata.GetSize();
+                    releasedBlockSize  = block.Metadata.GetSize();
+                    releasedBlockMemory = block.Memory;
+                    m_Allocator?.NotifyDeviceMemoryFreed(m_MemoryTypeIndex, releasedBlockMemory, releasedBlockSize);
                     block.Destroy(m_VkFunctions, m_Device, pAc);
                     m_Blocks.Remove(block);
                 }
@@ -358,6 +403,7 @@ namespace CursedVMA.Internal
         internal unsafe void Free(VmaAllocation allocation)
         {
             var block = allocation.Block;
+            DeviceMemory releasedBlockMemory = default;
             ulong releasedBlockSize = 0;
             lock (m_MutexLock)
             {
@@ -367,7 +413,9 @@ namespace CursedVMA.Internal
                 {
                     AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
                     AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
-                    releasedBlockSize = block.Metadata.GetSize();
+                    releasedBlockSize   = block.Metadata.GetSize();
+                    releasedBlockMemory = block.Memory;
+                    m_Allocator?.NotifyDeviceMemoryFreed(m_MemoryTypeIndex, releasedBlockMemory, releasedBlockSize);
                     block.Destroy(m_VkFunctions, m_Device, pAc);
                     m_Blocks.Remove(block);
                 }

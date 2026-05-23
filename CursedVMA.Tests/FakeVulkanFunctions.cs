@@ -35,6 +35,10 @@ namespace CursedVMA.Tests
         // Most recent MappedMemoryRange seen by Flush/Invalidate; for assertions.
         public MappedMemoryRange LastMappedMemoryRange;
 
+        // SType of the first struct in the pNext chain of the most recent
+        // AllocateMemory call; null when pNext was null.
+        public StructureType? LastAllocatePNextSType;
+
         // Configurable return values for failure-path tests.
         public Result AllocateMemoryResult = Result.Success;
         public Result CreateBufferResult   = Result.Success;
@@ -54,13 +58,16 @@ namespace CursedVMA.Tests
         private ulong m_NextBufferHandle = 1;
         private ulong m_NextImageHandle  = 1;
 
-        public Result AllocateMemory(
+        public unsafe Result AllocateMemory(
             Device device,
             in MemoryAllocateInfo allocateInfo,
             AllocationCallbacks* pAllocator,
             out DeviceMemory memory)
         {
             AllocateMemoryCallCount++;
+            LastAllocatePNextSType = allocateInfo.PNext != null
+                ? *(StructureType*)allocateInfo.PNext
+                : (StructureType?)null;
             if (AllocateMemoryResult != Result.Success)
             {
                 memory = default;

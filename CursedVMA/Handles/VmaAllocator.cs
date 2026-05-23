@@ -28,6 +28,9 @@ namespace CursedVMA
         // Default preferred block size when the caller passes zero.
         private const ulong DefaultPreferredLargeHeapBlockSize = 256ul * 1024 * 1024;
 
+        // Default priority for default (non-pool) block vectors.
+        private const float DefaultMemoryPriority = 0.5f;
+
         // A heap smaller than this gets a block size of heapSize/8 instead.
         private const ulong SmallHeapMaxSize = 1024ul * 1024 * 1024;
 
@@ -61,6 +64,10 @@ namespace CursedVMA
         private readonly long[] m_HeapBytes;
         private readonly ulong[] m_HeapSizeLimit;
 
+        // Optional callbacks invoked after every vkAllocateMemory and before
+        // every vkFreeMemory. Mirrors VmaDeviceMemoryCallbacks in C++ VMA.
+        private readonly VmaDeviceMemoryCallbacks? m_DeviceMemoryCallbacks;
+
         private bool m_IsDisposed;
 
         private VmaAllocator(
@@ -74,7 +81,8 @@ namespace CursedVMA
             PhysicalDeviceLimits deviceLimits,
             uint vulkanApiVersion,
             ulong preferredLargeHeapBlockSize,
-            ulong[]? heapSizeLimit)
+            ulong[]? heapSizeLimit,
+            VmaDeviceMemoryCallbacks? deviceMemoryCallbacks)
         {
             VkFunctions = vkFunctions;
             Flags = flags;
@@ -86,6 +94,7 @@ namespace CursedVMA
             DeviceLimits = deviceLimits;
             VulkanApiVersion = vulkanApiVersion;
             PreferredLargeHeapBlockSize = preferredLargeHeapBlockSize;
+            m_DeviceMemoryCallbacks = deviceMemoryCallbacks;
 
             uint heapCount = memoryProperties.MemoryHeapCount;
             m_HeapBytes     = new long[heapCount];
@@ -168,7 +177,8 @@ namespace CursedVMA
                 devProps.Limits,
                 createInfo.VulkanApiVersion,
                 preferredLargeBlockSize,
-                createInfo.HeapSizeLimit);
+                createInfo.HeapSizeLimit,
+                createInfo.DeviceMemoryCallbacks);
 
             for (uint i = 0; i < memProps.MemoryTypeCount; i++)
             {
@@ -189,7 +199,8 @@ namespace CursedVMA
                     explicitBlockSize: false,
                     minAllocationAlignment: 1,
                     pMemoryAllocateNext: 0,
-                    allocator: inst);
+                    allocator: inst,
+                    priority: DefaultMemoryPriority);
 
                 Result r = inst.m_pBlockVectors[i]!.Init();
                 if (r != Result.Success)
@@ -264,7 +275,8 @@ namespace CursedVMA
                 explicitBlockSize,
                 minAllocationAlignment,
                 (nint)createInfo.MemoryAllocateNext,
-                allocator: this);
+                allocator: this,
+                priority: createInfo.Priority);
 
             Result r = blockVector.Init();
             if (r != Result.Success)
@@ -1345,6 +1357,7 @@ namespace CursedVMA
                     AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
                     foreach (var alloc in m_DedicatedAllocations)
                     {
+                        NotifyDeviceMemoryFreed(alloc.MemoryTypeIndex, alloc.DedicatedMemory, alloc.Size);
                         VkFunctions.FreeMemory(Device, alloc.DedicatedMemory, pAc);
                         ReleaseHeapBytes(alloc.MemoryTypeIndex, alloc.Size);
                     }
@@ -1417,7 +1430,7 @@ namespace CursedVMA
             if ((createInfo.Flags & VmaAllocationCreateFlags.DedicatedMemoryBit) != 0)
             {
                 r = AllocateDedicatedMemory(memTypeIndex, vkMemReq.Size,
-                    alignment, out allocation);
+                    alignment, createInfo.Priority, out allocation);
                 if (r != Result.Success)
                     return r;
                 return FinishAllocation(allocation!, in createInfo);
@@ -1440,6 +1453,7 @@ namespace CursedVMA
             uint memoryTypeIndex,
             ulong size,
             ulong alignment,
+            float priority,
             out VmaAllocation? allocation)
         {
             allocation = null;
@@ -1452,10 +1466,39 @@ namespace CursedVMA
             AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
 
+            // Build pNext chain: MemoryAllocateFlagsInfo (device address) and
+            // MemoryPriorityAllocateInfoEXT, with priority at the head.
+            nint pNextChain = 0;
+
+            MemoryAllocateFlagsInfo flagsInfo = default;
+            if ((Flags & VmaAllocatorCreateFlags.BufferDeviceAddressBit) != 0)
+            {
+                flagsInfo = new MemoryAllocateFlagsInfo
+                {
+                    SType  = StructureType.MemoryAllocateFlagsInfo,
+                    PNext  = (void*)pNextChain,
+                    Flags  = MemoryAllocateFlags.AddressBit,
+                };
+                pNextChain = (nint)(&flagsInfo);
+            }
+
+            MemoryPriorityAllocateInfoEXT priorityInfo = default;
+            if ((Flags & VmaAllocatorCreateFlags.ExtMemoryPriorityBit) != 0)
+            {
+                priorityInfo = new MemoryPriorityAllocateInfoEXT
+                {
+                    SType    = StructureType.MemoryPriorityAllocateInfoExt,
+                    PNext    = (void*)pNextChain,
+                    Priority = priority,
+                };
+                pNextChain = (nint)(&priorityInfo);
+            }
+
             var allocInfo = new MemoryAllocateInfo
             {
-                SType = StructureType.MemoryAllocateInfo,
-                AllocationSize = size,
+                SType           = StructureType.MemoryAllocateInfo,
+                PNext           = (void*)pNextChain,
+                AllocationSize  = size,
                 MemoryTypeIndex = memoryTypeIndex,
             };
 
@@ -1466,6 +1509,8 @@ namespace CursedVMA
                 ReleaseHeapBytes(memoryTypeIndex, size);
                 return r;
             }
+
+            NotifyDeviceMemoryAllocated(memoryTypeIndex, memory, size);
 
             allocation = VmaAllocation.CreateDedicatedAllocation(
                 memory, size, alignment, memoryTypeIndex);
@@ -1481,6 +1526,7 @@ namespace CursedVMA
             lock (m_DedicatedMutex)
                 m_DedicatedAllocations.Remove(allocation);
 
+            NotifyDeviceMemoryFreed(allocation.MemoryTypeIndex, allocation.DedicatedMemory, allocation.Size);
             AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
             VkFunctions.FreeMemory(Device, allocation.DedicatedMemory, pAc);
@@ -1520,6 +1566,146 @@ namespace CursedVMA
 
         internal int DedicatedAllocationCount
         { get { lock (m_DedicatedMutex) return m_DedicatedAllocations.Count; } }
+
+        /// <summary>
+        /// Fires the <see cref="VmaDeviceMemoryCallbacks.PfnAllocate"/> callback
+        /// (if registered) after a successful <c>vkAllocateMemory</c>. Called by
+        /// <see cref="VmaBlockVector"/> and the dedicated-allocation path.
+        /// </summary>
+        internal void NotifyDeviceMemoryAllocated(uint memTypeIndex, DeviceMemory memory, ulong size)
+            => m_DeviceMemoryCallbacks?.PfnAllocate?.Invoke(
+                this, memTypeIndex, memory, size, m_DeviceMemoryCallbacks.UserData);
+
+        /// <summary>
+        /// Fires the <see cref="VmaDeviceMemoryCallbacks.PfnFree"/> callback
+        /// (if registered) just before <c>vkFreeMemory</c>. Called by
+        /// <see cref="VmaBlockVector"/> and the dedicated-free path.
+        /// </summary>
+        internal void NotifyDeviceMemoryFreed(uint memTypeIndex, DeviceMemory memory, ulong size)
+            => m_DeviceMemoryCallbacks?.PfnFree?.Invoke(
+                this, memTypeIndex, memory, size, m_DeviceMemoryCallbacks.UserData);
+
+        // ── Phase 16: aliasing resources ─────────────────────────────────────
+
+        /// <summary>
+        /// Creates a <c>VkBuffer</c> bound to <paramref name="allocation"/>'s
+        /// memory at its current offset. The buffer aliases the allocation's
+        /// memory and must be destroyed by the caller; the allocation is not
+        /// affected. Equivalent to <c>vmaCreateAliasingBuffer</c>.
+        /// </summary>
+        public unsafe Result CreateAliasingBuffer(
+            VmaAllocation allocation,
+            in BufferCreateInfo bufferCreateInfo,
+            out Silk.NET.Vulkan.Buffer buffer)
+        {
+            RequireNotDisposed();
+            buffer = default;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateBuffer(Device, in bufferCreateInfo, pAc, out buffer);
+            if (r != Result.Success)
+                return r;
+
+            r = BindBufferMemory(allocation, buffer);
+            if (r != Result.Success)
+            {
+                VkFunctions.DestroyBuffer(Device, buffer, pAc);
+                buffer = default;
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// Creates a <c>VkBuffer</c> bound to <paramref name="allocation"/>'s
+        /// memory at <c>allocation.Offset + allocationLocalOffset</c>, using
+        /// <c>vkBindBufferMemory2</c>. Equivalent to <c>vmaCreateAliasingBuffer2</c>.
+        /// </summary>
+        public unsafe Result CreateAliasingBuffer2(
+            VmaAllocation allocation,
+            ulong allocationLocalOffset,
+            in BufferCreateInfo bufferCreateInfo,
+            out Silk.NET.Vulkan.Buffer buffer)
+        {
+            RequireNotDisposed();
+            buffer = default;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateBuffer(Device, in bufferCreateInfo, pAc, out buffer);
+            if (r != Result.Success)
+                return r;
+
+            r = BindBufferMemory2(allocation, allocationLocalOffset, buffer, null);
+            if (r != Result.Success)
+            {
+                VkFunctions.DestroyBuffer(Device, buffer, pAc);
+                buffer = default;
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// Creates a <c>VkImage</c> bound to <paramref name="allocation"/>'s
+        /// memory at its current offset. The image aliases the allocation's
+        /// memory and must be destroyed by the caller; the allocation is not
+        /// affected. Equivalent to <c>vmaCreateAliasingImage</c>.
+        /// </summary>
+        public unsafe Result CreateAliasingImage(
+            VmaAllocation allocation,
+            in ImageCreateInfo imageCreateInfo,
+            out Image image)
+        {
+            RequireNotDisposed();
+            image = default;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateImage(Device, in imageCreateInfo, pAc, out image);
+            if (r != Result.Success)
+                return r;
+
+            r = BindImageMemory(allocation, image);
+            if (r != Result.Success)
+            {
+                VkFunctions.DestroyImage(Device, image, pAc);
+                image = default;
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// Creates a <c>VkImage</c> bound to <paramref name="allocation"/>'s
+        /// memory at <c>allocation.Offset + allocationLocalOffset</c>, using
+        /// <c>vkBindImageMemory2</c>. Equivalent to <c>vmaCreateAliasingImage2</c>.
+        /// </summary>
+        public unsafe Result CreateAliasingImage2(
+            VmaAllocation allocation,
+            ulong allocationLocalOffset,
+            in ImageCreateInfo imageCreateInfo,
+            out Image image)
+        {
+            RequireNotDisposed();
+            image = default;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateImage(Device, in imageCreateInfo, pAc, out image);
+            if (r != Result.Success)
+                return r;
+
+            r = BindImageMemory2(allocation, allocationLocalOffset, image, null);
+            if (r != Result.Success)
+            {
+                VkFunctions.DestroyImage(Device, image, pAc);
+                image = default;
+            }
+            return r;
+        }
 
         private unsafe Result FinishAllocation(
             VmaAllocation allocation,

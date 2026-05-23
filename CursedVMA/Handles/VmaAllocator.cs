@@ -40,6 +40,7 @@ namespace CursedVMA
         internal Device Device { get; }
         internal AllocationCallbacks? AllocatorCallbacks { get; }
         internal PhysicalDeviceMemoryProperties MemoryProperties { get; }
+        internal PhysicalDeviceProperties DeviceProperties { get; }
         internal PhysicalDeviceLimits DeviceLimits { get; }
         internal VmaAllocatorCreateFlags Flags { get; }
         internal uint VulkanApiVersion { get; }
@@ -78,7 +79,7 @@ namespace CursedVMA
             Device device,
             AllocationCallbacks? allocatorCallbacks,
             PhysicalDeviceMemoryProperties memoryProperties,
-            PhysicalDeviceLimits deviceLimits,
+            PhysicalDeviceProperties physicalDeviceProperties,
             uint vulkanApiVersion,
             ulong preferredLargeHeapBlockSize,
             ulong[]? heapSizeLimit,
@@ -91,7 +92,8 @@ namespace CursedVMA
             Device = device;
             AllocatorCallbacks = allocatorCallbacks;
             MemoryProperties = memoryProperties;
-            DeviceLimits = deviceLimits;
+            DeviceProperties = physicalDeviceProperties;
+            DeviceLimits = physicalDeviceProperties.Limits;
             VulkanApiVersion = vulkanApiVersion;
             PreferredLargeHeapBlockSize = preferredLargeHeapBlockSize;
             m_DeviceMemoryCallbacks = deviceMemoryCallbacks;
@@ -174,7 +176,7 @@ namespace CursedVMA
                 createInfo.Device,
                 createInfo.AllocationCallbacks,
                 memProps,
-                devProps.Limits,
+                devProps,
                 createInfo.VulkanApiVersion,
                 preferredLargeBlockSize,
                 createInfo.HeapSizeLimit,
@@ -1218,6 +1220,164 @@ namespace CursedVMA
 
             MappedMemoryRange range = BuildMappedMemoryRange(allocation, offset, size);
             return VkFunctions.InvalidateMappedMemoryRanges(Device, 1, &range);
+        }
+
+        /// <summary>
+        /// Batch-flushes the given allocations in a single
+        /// <c>vkFlushMappedMemoryRanges</c> call. Non-coherent allocations only;
+        /// coherent entries are silently skipped. When <paramref name="offsets"/>
+        /// is shorter than <paramref name="allocations"/> missing entries default
+        /// to 0; when <paramref name="sizes"/> is shorter they default to
+        /// <see cref="Vk.WholeSize"/>. Equivalent to <c>vmaFlushAllocations</c>.
+        /// </summary>
+        public unsafe Result FlushAllocations(
+            ReadOnlySpan<VmaAllocation?> allocations,
+            ReadOnlySpan<ulong>          offsets,
+            ReadOnlySpan<ulong>          sizes)
+        {
+            RequireNotDisposed();
+            return BatchCacheOp(allocations, offsets, sizes, flush: true);
+        }
+
+        /// <summary>
+        /// Batch-invalidates the given allocations in a single
+        /// <c>vkInvalidateMappedMemoryRanges</c> call. Symmetric to
+        /// <see cref="FlushAllocations"/>. Equivalent to
+        /// <c>vmaInvalidateAllocations</c>.
+        /// </summary>
+        public unsafe Result InvalidateAllocations(
+            ReadOnlySpan<VmaAllocation?> allocations,
+            ReadOnlySpan<ulong>          offsets,
+            ReadOnlySpan<ulong>          sizes)
+        {
+            RequireNotDisposed();
+            return BatchCacheOp(allocations, offsets, sizes, flush: false);
+        }
+
+        private unsafe Result BatchCacheOp(
+            ReadOnlySpan<VmaAllocation?> allocations,
+            ReadOnlySpan<ulong>          offsets,
+            ReadOnlySpan<ulong>          sizes,
+            bool flush)
+        {
+            int n = allocations.Length;
+            if (n == 0) return Result.Success;
+
+            // Count non-coherent entries to size the range array.
+            int rangeCount = 0;
+            for (int i = 0; i < n; i++)
+                if (allocations[i] != null
+                    && IsMemoryTypeNonCoherent(allocations[i]!.MemoryTypeIndex))
+                    rangeCount++;
+
+            if (rangeCount == 0) return Result.Success;
+
+            MappedMemoryRange[] ranges = new MappedMemoryRange[rangeCount];
+            int ri = 0;
+            for (int i = 0; i < n; i++)
+            {
+                var a = allocations[i];
+                if (a == null || !IsMemoryTypeNonCoherent(a.MemoryTypeIndex)) continue;
+                ulong off  = i < offsets.Length ? offsets[i] : 0ul;
+                ulong size = i < sizes.Length   ? sizes[i]   : Vk.WholeSize;
+                ranges[ri++] = BuildMappedMemoryRange(a, off, size);
+            }
+
+            fixed (MappedMemoryRange* pRanges = ranges)
+            {
+                return flush
+                    ? VkFunctions.FlushMappedMemoryRanges(Device, (uint)rangeCount, pRanges)
+                    : VkFunctions.InvalidateMappedMemoryRanges(Device, (uint)rangeCount, pRanges);
+            }
+        }
+
+        /// <summary>
+        /// Maps <paramref name="dstAllocation"/>, copies <paramref name="size"/>
+        /// bytes from <paramref name="pSrcHostPointer"/> into it starting at
+        /// <paramref name="dstAllocationLocalOffset"/>, then unmaps. Equivalent
+        /// to <c>vmaCopyMemoryToAllocation</c>.
+        /// </summary>
+        public unsafe Result CopyMemoryToAllocation(
+            void*          pSrcHostPointer,
+            VmaAllocation  dstAllocation,
+            ulong          dstAllocationLocalOffset,
+            ulong          size)
+        {
+            RequireNotDisposed();
+            Result r = MapMemory(dstAllocation, out void* pMapped);
+            if (r != Result.Success) return r;
+            System.Buffer.MemoryCopy(
+                pSrcHostPointer,
+                (byte*)pMapped + dstAllocationLocalOffset,
+                size, size);
+            UnmapMemory(dstAllocation);
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Maps <paramref name="srcAllocation"/>, copies <paramref name="size"/>
+        /// bytes starting at <paramref name="srcAllocationLocalOffset"/> into
+        /// <paramref name="pDstHostPointer"/>, then unmaps. Equivalent to
+        /// <c>vmaCopyAllocationToMemory</c>.
+        /// </summary>
+        public unsafe Result CopyAllocationToMemory(
+            VmaAllocation  srcAllocation,
+            ulong          srcAllocationLocalOffset,
+            void*          pDstHostPointer,
+            ulong          size)
+        {
+            RequireNotDisposed();
+            Result r = MapMemory(srcAllocation, out void* pMapped);
+            if (r != Result.Success) return r;
+            System.Buffer.MemoryCopy(
+                (byte*)pMapped + srcAllocationLocalOffset,
+                pDstHostPointer,
+                size, size);
+            UnmapMemory(srcAllocation);
+            return Result.Success;
+        }
+
+        /// <summary>
+        /// Returns the physical-device memory properties that were queried when
+        /// this allocator was created. Equivalent to <c>vmaGetMemoryProperties</c>.
+        /// </summary>
+        public void GetMemoryProperties(out PhysicalDeviceMemoryProperties memoryProperties)
+        {
+            RequireNotDisposed();
+            memoryProperties = MemoryProperties;
+        }
+
+        /// <summary>
+        /// Returns the <see cref="MemoryPropertyFlags"/> for the given memory
+        /// type index. Equivalent to <c>vmaGetMemoryTypeProperties</c>.
+        /// </summary>
+        public void GetMemoryTypeProperties(
+            uint memoryTypeIndex, out MemoryPropertyFlags propertyFlags)
+        {
+            RequireNotDisposed();
+            propertyFlags = GetMemoryType(memoryTypeIndex).PropertyFlags;
+        }
+
+        /// <summary>
+        /// Returns the physical-device properties that were queried when this
+        /// allocator was created. Equivalent to <c>vmaGetPhysicalDeviceProperties</c>.
+        /// </summary>
+        public void GetPhysicalDeviceProperties(out PhysicalDeviceProperties properties)
+        {
+            RequireNotDisposed();
+            properties = DeviceProperties;
+        }
+
+        /// <summary>
+        /// Returns the <see cref="MemoryPropertyFlags"/> of the Vulkan memory
+        /// type backing <paramref name="allocation"/>. Equivalent to
+        /// <c>vmaGetAllocationMemoryProperties</c>.
+        /// </summary>
+        public void GetAllocationMemoryProperties(
+            VmaAllocation allocation, out MemoryPropertyFlags propertyFlags)
+        {
+            RequireNotDisposed();
+            propertyFlags = GetMemoryType(allocation.MemoryTypeIndex).PropertyFlags;
         }
 
         private bool IsMemoryTypeNonCoherent(uint memoryTypeIndex)

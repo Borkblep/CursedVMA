@@ -8,6 +8,7 @@
 // offset. Free blocks are also linked through per-bin singly-linked free lists;
 // the null block is excluded from those lists.
 
+using Silk.NET.Vulkan;
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
@@ -65,8 +66,8 @@ namespace CursedVMA.Internal.Algorithms
         private nuint m_BlocksFreeCount; // free blocks in the free lists (not null block)
         private ulong m_SumFreeSize;
 
-        public VmaBlockMetadataTlsf(ulong bufferImageGranularity, bool isVirtual)
-            : base(bufferImageGranularity, isVirtual) { }
+        public VmaBlockMetadataTlsf(ulong bufferImageGranularity, bool isVirtual, ulong debugMargin = 0)
+            : base(bufferImageGranularity, isVirtual, debugMargin) { }
 
         // ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -205,6 +206,22 @@ namespace CursedVMA.Internal.Algorithms
             return true;
         }
 
+        // ── Corruption detection ─────────────────────────────────────────────────
+
+        public override unsafe Result CheckCorruption(byte* pBlockData)
+        {
+            if (m_DebugMargin == 0) return Result.ErrorFeatureNotPresent;
+
+            foreach (var block in m_Allocations.Values)
+            {
+                if (!ValidateMagicValue(pBlockData, block.Offset, m_DebugMargin))
+                    return Result.ErrorUnknown;
+                if (!ValidateMagicValue(pBlockData, block.Offset + block.Size - m_DebugMargin, m_DebugMargin))
+                    return Result.ErrorUnknown;
+            }
+            return Result.Success;
+        }
+
         // ── Allocation ───────────────────────────────────────────────────────────
 
         public override bool CreateAllocationRequest(
@@ -219,7 +236,8 @@ namespace CursedVMA.Internal.Algorithms
             // TLSF does not support upper-address allocations.
             if (allocSize == 0 || allocSize > m_Size || upperAddress) return false;
 
-            ulong searchSize = RoundUpToTlsfClass(allocSize);
+            ulong paddedSize = allocSize + 2 * m_DebugMargin;
+            ulong searchSize = RoundUpToTlsfClass(paddedSize);
             TlsfBlock? candidate = SearchFreeBlock(searchSize);
 
             if (candidate != null
@@ -228,7 +246,7 @@ namespace CursedVMA.Internal.Algorithms
                 request = new VmaAllocationRequest
                 {
                     AllocHandle = off + 1,
-                    Size = allocSize,
+                    Size = paddedSize,
                     CustomData = candidate,
                     Type = VmaAllocationRequestType.TLSF,
                 };
@@ -241,7 +259,7 @@ namespace CursedVMA.Internal.Algorithms
                 request = new VmaAllocationRequest
                 {
                     AllocHandle = nullOff + 1,
-                    Size = allocSize,
+                    Size = paddedSize,
                     CustomData = m_NullBlock,
                     Type = VmaAllocationRequestType.TLSF,
                 };
@@ -267,7 +285,7 @@ namespace CursedVMA.Internal.Algorithms
                 }
             }
 
-            if (offset + allocSize > block.Offset + block.Size) return false;
+            if (offset + allocSize + 2 * m_DebugMargin > block.Offset + block.Size) return false;
 
             if (m_BufferImageGranularity > 1 && block.NextPhys is { IsFree: false } nextLive)
             {

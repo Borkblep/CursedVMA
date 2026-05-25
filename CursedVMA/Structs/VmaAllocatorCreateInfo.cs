@@ -61,5 +61,12 @@ namespace CursedVMA
         /// memory type, max 32). VMA will pass these through to
         /// <c>VkExportMemoryAllocateInfoKHR</c> for matching allocations.</summary>
         public ExternalMemoryHandleTypeFlags[]? TypeExternalMemoryHandleTypes;
+
+        /// <summary>Number of bytes to reserve as a guard margin before and after
+        /// every suballocation. When non-zero, magic sentinel bytes are written on
+        /// each allocation and verified by <c>VmaAllocator.CheckCorruption</c>.
+        /// Equivalent to the C++ <c>VMA_DEBUG_MARGIN</c> compile-time constant.
+        /// Zero (the default) disables corruption detection.</summary>
+        public ulong DebugMargin;
     }
 }

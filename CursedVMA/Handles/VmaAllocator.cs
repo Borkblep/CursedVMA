@@ -45,6 +45,7 @@ namespace CursedVMA
         internal VmaAllocatorCreateFlags Flags { get; }
         internal uint VulkanApiVersion { get; }
         internal ulong PreferredLargeHeapBlockSize { get; }
+        internal ulong DebugMargin { get; }
 
         // One default block vector per Vulkan memory type (up to VK_MAX_MEMORY_TYPES).
         private readonly VmaBlockVector?[] m_pBlockVectors =
@@ -86,7 +87,8 @@ namespace CursedVMA
             uint vulkanApiVersion,
             ulong preferredLargeHeapBlockSize,
             ulong[]? heapSizeLimit,
-            VmaDeviceMemoryCallbacks? deviceMemoryCallbacks)
+            VmaDeviceMemoryCallbacks? deviceMemoryCallbacks,
+            ulong debugMargin = 0)
         {
             VkFunctions = vkFunctions;
             Flags = flags;
@@ -100,6 +102,7 @@ namespace CursedVMA
             VulkanApiVersion = vulkanApiVersion;
             PreferredLargeHeapBlockSize = preferredLargeHeapBlockSize;
             m_DeviceMemoryCallbacks = deviceMemoryCallbacks;
+            DebugMargin = debugMargin;
 
             uint heapCount = memoryProperties.MemoryHeapCount;
             m_HeapBytes     = new long[heapCount];
@@ -183,7 +186,8 @@ namespace CursedVMA
                 createInfo.VulkanApiVersion,
                 preferredLargeBlockSize,
                 createInfo.HeapSizeLimit,
-                createInfo.DeviceMemoryCallbacks);
+                createInfo.DeviceMemoryCallbacks,
+                createInfo.DebugMargin);
 
             for (uint i = 0; i < memProps.MemoryTypeCount; i++)
             {
@@ -205,7 +209,8 @@ namespace CursedVMA
                     minAllocationAlignment: 1,
                     pMemoryAllocateNext: 0,
                     allocator: inst,
-                    priority: DefaultMemoryPriority);
+                    priority: DefaultMemoryPriority,
+                    debugMargin: createInfo.DebugMargin);
 
                 Result r = inst.m_pBlockVectors[i]!.Init();
                 if (r != Result.Success)
@@ -281,7 +286,8 @@ namespace CursedVMA
                 minAllocationAlignment,
                 (nint)createInfo.MemoryAllocateNext,
                 allocator: this,
-                priority: createInfo.Priority);
+                priority: createInfo.Priority,
+                debugMargin: DebugMargin);
 
             Result r = blockVector.Init();
             if (r != Result.Success)
@@ -795,6 +801,59 @@ namespace CursedVMA
         {
             RequireNotDisposed();
             m_CurrentFrameIndex = frameIndex;
+        }
+
+        /// <summary>
+        /// Checks every suballocation in every block of the memory types matching
+        /// <paramref name="memoryTypeBits"/> for debug-margin corruption. Returns
+        /// <see cref="Result.Success"/> when all checked blocks are clean,
+        /// <see cref="Result.ErrorFeatureNotPresent"/> when no debug margin is
+        /// configured for any matching type, or the first corruption error found.
+        /// Equivalent to <c>vmaCheckCorruption</c>.
+        /// </summary>
+        public Result CheckCorruption(uint memoryTypeBits)
+        {
+            RequireNotDisposed();
+
+            Result finalResult = Result.ErrorFeatureNotPresent;
+            for (uint i = 0; i < MemoryTypeCount; i++)
+            {
+                if ((memoryTypeBits & (1u << (int)i)) == 0) continue;
+                var bv = m_pBlockVectors[i];
+                if (bv == null) continue;
+
+                Result r = bv.CheckCorruption();
+                if (r == Result.ErrorFeatureNotPresent) continue;
+                if (r != Result.Success) return r;
+                finalResult = Result.Success;
+            }
+
+            lock (m_PoolsMutex)
+            {
+                foreach (var pool in m_Pools)
+                {
+                    if ((memoryTypeBits & (1u << (int)pool.BlockVector.MemoryTypeIndex)) == 0) continue;
+                    Result r = pool.BlockVector.CheckCorruption();
+                    if (r == Result.ErrorFeatureNotPresent) continue;
+                    if (r != Result.Success) return r;
+                    finalResult = Result.Success;
+                }
+            }
+
+            return finalResult;
+        }
+
+        /// <summary>
+        /// Checks every suballocation in every block of <paramref name="pool"/>
+        /// for debug-margin corruption. Returns <see cref="Result.Success"/> when
+        /// all blocks are clean, <see cref="Result.ErrorFeatureNotPresent"/> when
+        /// no debug margin is configured, or the first corruption error found.
+        /// Equivalent to <c>vmaCheckPoolCorruption</c>.
+        /// </summary>
+        public Result CheckPoolCorruption(VmaPool pool)
+        {
+            RequireNotDisposed();
+            return pool.BlockVector.CheckCorruption();
         }
 
         /// <summary>

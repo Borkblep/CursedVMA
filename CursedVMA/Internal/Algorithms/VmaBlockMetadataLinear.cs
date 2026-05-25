@@ -11,6 +11,7 @@
 // ascending (ring-buffer) or descending (double-stack), so both can be searched
 // with a binary search adapted to their ordering.
 
+using Silk.NET.Vulkan;
 using System;
 using System.Collections.Generic;
 
@@ -35,8 +36,8 @@ namespace CursedVMA.Internal.Algorithms
         // Kept in sync by Alloc/Free so GetSumFreeSize is O(1).
         private ulong m_SumFreeSize;
 
-        public VmaBlockMetadataLinear(ulong bufferImageGranularity, bool isVirtual)
-            : base(bufferImageGranularity, isVirtual)
+        public VmaBlockMetadataLinear(ulong bufferImageGranularity, bool isVirtual, ulong debugMargin = 0)
+            : base(bufferImageGranularity, isVirtual, debugMargin)
         {
             m_Suballocations1 = new List<VmaSuballocation>();
             m_Suballocations2 = new List<VmaSuballocation>();
@@ -329,6 +330,41 @@ namespace CursedVMA.Internal.Algorithms
             return true;
         }
 
+        // ── Corruption detection ─────────────────────────────────────────────────
+
+        public override unsafe Result CheckCorruption(byte* pBlockData)
+        {
+            if (m_DebugMargin == 0) return Result.ErrorFeatureNotPresent;
+
+            var sub1 = GetSuballocations1st();
+            var sub2 = GetSuballocations2nd();
+
+            for (int i = m_1stNullItemsBeginCount; i < sub1.Count; i++)
+            {
+                var s = sub1[i];
+                if (s.Type == VmaSuballocationType.Free) continue;
+                if (!ValidateMagicValue(pBlockData, s.Offset, m_DebugMargin))
+                    return Result.ErrorUnknown;
+                if (!ValidateMagicValue(pBlockData, s.Offset + s.Size - m_DebugMargin, m_DebugMargin))
+                    return Result.ErrorUnknown;
+            }
+
+            if (m_2ndVectorMode != SecondVectorMode.Empty)
+            {
+                for (int i = 0; i < sub2.Count; i++)
+                {
+                    var s = sub2[i];
+                    if (s.Type == VmaSuballocationType.Free) continue;
+                    if (!ValidateMagicValue(pBlockData, s.Offset, m_DebugMargin))
+                        return Result.ErrorUnknown;
+                    if (!ValidateMagicValue(pBlockData, s.Offset + s.Size - m_DebugMargin, m_DebugMargin))
+                        return Result.ErrorUnknown;
+                }
+            }
+
+            return Result.Success;
+        }
+
         // ── Allocation ───────────────────────────────────────────────────────────
 
         public override bool CreateAllocationRequest(
@@ -385,7 +421,7 @@ namespace CursedVMA.Internal.Algorithms
                     ? sub2[sub2.Count - 1].Offset
                     : m_Size;
 
-                if (resultOffset + allocSize > freeSpaceEnd) return false;
+                if (resultOffset + allocSize + 2 * m_DebugMargin > freeSpaceEnd) return false;
 
                 if (m_BufferImageGranularity > 1 && m_2ndVectorMode == SecondVectorMode.DoubleStack
                     && sub2.Count > 0)
@@ -402,7 +438,7 @@ namespace CursedVMA.Internal.Algorithms
                 request = new VmaAllocationRequest
                 {
                     AllocHandle = resultOffset + 1,
-                    Size = allocSize,
+                    Size = allocSize + 2 * m_DebugMargin,
                     Type = VmaAllocationRequestType.EndOf1st,
                 };
                 return true;
@@ -431,7 +467,7 @@ namespace CursedVMA.Internal.Algorithms
                     ? sub1[m_1stNullItemsBeginCount].Offset
                     : m_Size;
 
-                if (resultOffset + allocSize > freeSpaceEnd) return false;
+                if (resultOffset + allocSize + 2 * m_DebugMargin > freeSpaceEnd) return false;
 
                 if (m_BufferImageGranularity > 1 && sub1.Count > m_1stNullItemsBeginCount)
                 {
@@ -447,7 +483,7 @@ namespace CursedVMA.Internal.Algorithms
                 request = new VmaAllocationRequest
                 {
                     AllocHandle = resultOffset + 1,
-                    Size = allocSize,
+                    Size = allocSize + 2 * m_DebugMargin,
                     Type = VmaAllocationRequestType.EndOf2nd,
                 };
                 return true;
@@ -469,8 +505,9 @@ namespace CursedVMA.Internal.Algorithms
                 ? sub2[sub2.Count - 1].Offset
                 : m_Size;
 
-            if (resultOffset < allocSize) return false;
-            resultOffset -= allocSize;
+            ulong totalSize = allocSize + 2 * m_DebugMargin;
+            if (resultOffset < totalSize) return false;
+            resultOffset -= totalSize;
             resultOffset = VmaMath.AlignDown(resultOffset, allocAlignment);
 
             if (m_BufferImageGranularity > 1 && sub2.Count > 0)
@@ -490,7 +527,7 @@ namespace CursedVMA.Internal.Algorithms
                 ? sub1[sub1.Count - 1].Offset + sub1[sub1.Count - 1].Size
                 : 0ul;
 
-            if (resultOffset < freeSpaceBegin || resultOffset < allocSize) return false;
+            if (resultOffset < freeSpaceBegin || resultOffset < totalSize) return false;
 
             if (m_BufferImageGranularity > 1 && sub1.Count > m_1stNullItemsBeginCount)
             {
@@ -510,7 +547,7 @@ namespace CursedVMA.Internal.Algorithms
             request = new VmaAllocationRequest
             {
                 AllocHandle = resultOffset + 1,
-                Size = allocSize,
+                Size = allocSize + 2 * m_DebugMargin,
                 Type = VmaAllocationRequestType.UpperAddress,
             };
             return true;

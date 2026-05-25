@@ -51,7 +51,8 @@ namespace CursedVMA.Internal
             VmaPoolCreateFlags algorithm,
             ulong bufferImageGranularity,
             out VmaDeviceMemoryBlock? block,
-            nint pMemoryAllocateNext = 0)
+            nint pMemoryAllocateNext = 0,
+            ulong debugMargin = 0)
         {
             block = null;
             if (size == 0)
@@ -72,12 +73,58 @@ namespace CursedVMA.Internal
 
             bool linear = (algorithm & VmaPoolCreateFlags.LinearAlgorithmBit) != 0;
             VmaBlockMetadata metadata = linear
-                ? new VmaBlockMetadataLinear(bufferImageGranularity, isVirtual: false)
-                : new VmaBlockMetadataTlsf(bufferImageGranularity, isVirtual: false);
+                ? new VmaBlockMetadataLinear(bufferImageGranularity, isVirtual: false, debugMargin)
+                : new VmaBlockMetadataTlsf(bufferImageGranularity, isVirtual: false, debugMargin);
             metadata.Init(size);
 
             block = new VmaDeviceMemoryBlock(memoryTypeIndex, id, memory, metadata);
             return Result.Success;
+        }
+
+        /// <summary>
+        /// Maps the block, writes debug-sentinel bytes into the guard margins
+        /// immediately surrounding the user data, then unmaps. Called after every
+        /// suballocation when a non-zero debug margin is configured. Silently
+        /// skips un-mappable blocks (e.g. device-local without host-visible).
+        /// </summary>
+        internal unsafe void WriteMagicValues(
+            IVulkanFunctions vkFunctions,
+            Device device,
+            ulong physicalOffset,
+            ulong userSize,
+            ulong margin)
+        {
+            if (Map(vkFunctions, device, 1, out void* pData) != Result.Success)
+                return;
+
+            byte* p = (byte*)pData;
+            // pre-margin
+            for (ulong i = 0; i < margin; i++) p[physicalOffset + i] = VmaBlockMetadata.DebugMagicByte;
+            // post-margin
+            ulong postStart = physicalOffset + margin + userSize;
+            for (ulong i = 0; i < margin; i++) p[postStart + i] = VmaBlockMetadata.DebugMagicByte;
+
+            Unmap(vkFunctions, device, 1);
+        }
+
+        /// <summary>
+        /// Maps the block, delegates to the metadata's
+        /// <see cref="VmaBlockMetadata.CheckCorruption"/> to verify all magic
+        /// sentinel bytes, then unmaps. Returns
+        /// <see cref="Result.ErrorFeatureNotPresent"/> when the debug margin is
+        /// zero, <see cref="Result.ErrorMemoryMapFailed"/> when the block cannot
+        /// be mapped, <see cref="Result.ErrorUnknown"/> on the first detected
+        /// corruption, or <see cref="Result.Success"/> when all regions are intact.
+        /// </summary>
+        internal unsafe Result CheckCorruption(IVulkanFunctions vkFunctions, Device device)
+        {
+            Result r = Map(vkFunctions, device, 1, out void* pData);
+            if (r != Result.Success)
+                return Result.ErrorMemoryMapFailed;
+
+            r = m_Metadata.CheckCorruption((byte*)pData);
+            Unmap(vkFunctions, device, 1);
+            return r;
         }
 
         /// <summary>

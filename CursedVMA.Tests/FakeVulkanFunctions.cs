@@ -11,8 +11,9 @@ namespace CursedVMA.Tests
 {
     internal sealed unsafe class FakeVulkanFunctions : IVulkanFunctions
     {
-        // Pinned buffer returned by every MapMemory call.
-        private static readonly byte[] s_MappedBuffer = new byte[4096];
+        // Pinned buffer returned by every MapMemory call. Exposed as internal so
+        // corruption-detection tests can directly read and corrupt specific bytes.
+        internal static readonly byte[] s_MappedBuffer = new byte[4096];
         private static readonly GCHandle s_MappedHandle =
             GCHandle.Alloc(s_MappedBuffer, GCHandleType.Pinned);
 

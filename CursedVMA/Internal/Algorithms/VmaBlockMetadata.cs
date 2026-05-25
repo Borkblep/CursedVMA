@@ -3,6 +3,7 @@
 // abstract surface. The class is intentionally non-thread-safe; serialization
 // is the caller's responsibility, matching VMA's contract.
 
+using Silk.NET.Vulkan;
 using System;
 
 namespace CursedVMA.Internal.Algorithms
@@ -25,10 +26,19 @@ namespace CursedVMA.Internal.Algorithms
         /// <summary>Total size of the block in bytes; set by <see cref="Init"/>.</summary>
         protected ulong m_Size;
 
-        protected VmaBlockMetadata(ulong bufferImageGranularity, bool isVirtual)
+        /// <summary>Debug guard margin in bytes. When non-zero, magic sentinel bytes
+        /// are written before and after every live suballocation so that
+        /// <see cref="CheckCorruption"/> can detect out-of-bounds writes.</summary>
+        protected readonly ulong m_DebugMargin;
+
+        /// <summary>Magic byte pattern written into every debug-margin region.</summary>
+        internal const byte DebugMagicByte = 0xEF;
+
+        protected VmaBlockMetadata(ulong bufferImageGranularity, bool isVirtual, ulong debugMargin = 0)
         {
             m_BufferImageGranularity = bufferImageGranularity;
             m_IsVirtual = isVirtual;
+            m_DebugMargin = debugMargin;
             m_Size = 0;
         }
 
@@ -120,6 +130,16 @@ namespace CursedVMA.Internal.Algorithms
         public abstract void Clear();
 
         /// <summary>
+        /// Walks every live suballocation in the block and verifies the debug
+        /// sentinel bytes that surround it. Returns
+        /// <see cref="Result.Success"/> when all magic values are intact,
+        /// <see cref="Result.ErrorUnknown"/> on the first corrupted region, and
+        /// <see cref="Result.ErrorFeatureNotPresent"/> when
+        /// <see cref="m_DebugMargin"/> is zero.
+        /// </summary>
+        public abstract unsafe Result CheckCorruption(byte* pBlockData);
+
+        /// <summary>
         /// Throw if <paramref name="condition"/> is false. Concrete metadata
         /// implementations use this in <see cref="Validate"/> to surface
         /// corrupted internal state.
@@ -130,6 +150,25 @@ namespace CursedVMA.Internal.Algorithms
             {
                 throw new InvalidOperationException(message);
             }
+        }
+
+        /// <summary>Fills <paramref name="count"/> bytes starting at
+        /// <c>pData[offset]</c> with <see cref="DebugMagicByte"/>.</summary>
+        protected static unsafe void WriteMagicValue(byte* pData, ulong offset, ulong count)
+        {
+            byte* p = pData + offset;
+            for (ulong i = 0; i < count; i++) p[i] = DebugMagicByte;
+        }
+
+        /// <summary>Returns true when every byte in the range
+        /// <c>pData[offset .. offset+count)</c> equals
+        /// <see cref="DebugMagicByte"/>.</summary>
+        protected static unsafe bool ValidateMagicValue(byte* pData, ulong offset, ulong count)
+        {
+            byte* p = pData + offset;
+            for (ulong i = 0; i < count; i++)
+                if (p[i] != DebugMagicByte) return false;
+            return true;
         }
     }
 }

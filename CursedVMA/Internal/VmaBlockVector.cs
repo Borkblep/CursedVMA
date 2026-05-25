@@ -35,6 +35,9 @@ namespace CursedVMA.Internal
         // allocator was created with ExtMemoryPriorityBit.
         private readonly float m_Priority;
 
+        // Debug guard margin in bytes; 0 disables corruption detection.
+        private readonly ulong m_DebugMargin;
+
         private readonly List<VmaDeviceMemoryBlock> m_Blocks = new List<VmaDeviceMemoryBlock>();
         private uint m_NextBlockId;
         private readonly object m_MutexLock = new object();
@@ -53,7 +56,8 @@ namespace CursedVMA.Internal
             ulong minAllocationAlignment,
             nint pMemoryAllocateNext = 0,
             VmaAllocator? allocator = null,
-            float priority = 0.5f)
+            float priority = 0.5f,
+            ulong debugMargin = 0)
         {
             m_VkFunctions = vkFunctions;
             m_Device = device;
@@ -69,6 +73,7 @@ namespace CursedVMA.Internal
             m_pMemoryAllocateNext = pMemoryAllocateNext;
             m_Allocator = allocator;
             m_Priority = priority;
+            m_DebugMargin = debugMargin;
         }
 
         internal uint MemoryTypeIndex => m_MemoryTypeIndex;
@@ -165,7 +170,8 @@ namespace CursedVMA.Internal
                 m_MemoryTypeIndex, blockSize, blockId,
                 m_Algorithm, m_BufferImageGranularity,
                 out VmaDeviceMemoryBlock? block,
-                pNextChain);
+                pNextChain,
+                m_DebugMargin);
 
             if (r != Result.Success)
             {
@@ -311,11 +317,16 @@ namespace CursedVMA.Internal
                     size, alignment, upperAddress, suballocType, strategy, out var request))
             {
                 block.Metadata.Alloc(in request, suballocType, null);
-                ulong offset = block.Metadata.GetAllocationOffset(request.AllocHandle);
+                ulong physicalOffset = block.Metadata.GetAllocationOffset(request.AllocHandle);
+                ulong userOffset     = physicalOffset + m_DebugMargin;
                 allocation = VmaAllocation.CreateBlockAllocation(
-                    this, block, request.AllocHandle, offset, size, alignment, m_MemoryTypeIndex);
+                    this, block, request.AllocHandle, userOffset, size, alignment, m_MemoryTypeIndex);
                 // Store back-reference so defrag can recover the VmaAllocation from metadata.
                 block.Metadata.SetAllocationUserData(request.AllocHandle, allocation);
+
+                if (m_DebugMargin > 0)
+                    block.WriteMagicValues(m_VkFunctions, m_Device, physicalOffset, size, m_DebugMargin);
+
                 return true;
             }
             allocation = null;
@@ -422,6 +433,29 @@ namespace CursedVMA.Internal
             }
             if (releasedBlockSize > 0)
                 m_Allocator?.ReleaseHeapBytes(m_MemoryTypeIndex, releasedBlockSize);
+        }
+
+        /// <summary>
+        /// Checks every block in the vector for debug-margin corruption. Returns
+        /// <see cref="Result.ErrorFeatureNotPresent"/> when no debug margin is
+        /// configured, <see cref="Result.Success"/> when all blocks are clean, or
+        /// the first error code returned by an individual block check.
+        /// Equivalent to <c>VmaBlockVector::CheckCorruption</c>.
+        /// </summary>
+        internal Result CheckCorruption()
+        {
+            if (m_DebugMargin == 0) return Result.ErrorFeatureNotPresent;
+
+            lock (m_MutexLock)
+            {
+                foreach (var block in m_Blocks)
+                {
+                    Result r = block.CheckCorruption(m_VkFunctions, m_Device);
+                    if (r != Result.Success && r != Result.ErrorFeatureNotPresent)
+                        return r;
+                }
+            }
+            return Result.Success;
         }
 
         /// <summary>

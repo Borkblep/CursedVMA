@@ -10,6 +10,9 @@ using CursedVMA.Internal;
 using CursedVMA.Internal.Algorithms;
 using Silk.NET.Vulkan;
 using System;
+using System.IO;
+using System.Text;
+using System.Text.Json;
 
 namespace CursedVMA
 {
@@ -189,6 +192,68 @@ namespace CursedVMA
         {
             stats = default;
             RequireMetadata().AddDetailedStatistics(ref stats);
+        }
+
+        /// <summary>
+        /// Builds a JSON string describing the block's detailed statistics, and
+        /// optionally the list of live suballocations when
+        /// <paramref name="detailedMap"/> is true. Equivalent to
+        /// <c>vmaBuildVirtualBlockStatsString</c> (no separate free call needed —
+        /// the returned string is GC-managed).
+        /// </summary>
+        public string BuildStatsString(bool detailedMap)
+        {
+            var metadata = RequireMetadata();
+
+            VmaDetailedStatistics stats = default;
+            metadata.AddDetailedStatistics(ref stats);
+
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream,
+                new JsonWriterOptions { Indented = true }))
+            {
+                writer.WriteStartObject();
+
+                // Flat detailed-statistics fields, matching the C++
+                // VmaPrintDetailedStatistics layout used by vmaBuildVirtualBlockStatsString.
+                writer.WriteNumber("BlockCount",         stats.Statistics.BlockCount);
+                writer.WriteNumber("BlockBytes",         stats.Statistics.BlockBytes);
+                writer.WriteNumber("AllocationCount",    stats.Statistics.AllocationCount);
+                writer.WriteNumber("AllocationBytes",    stats.Statistics.AllocationBytes);
+                writer.WriteNumber("UnusedRangeCount",   stats.UnusedRangeCount);
+                writer.WriteNumber("AllocationSizeMin",  stats.AllocationSizeMin);
+                writer.WriteNumber("AllocationSizeMax",  stats.AllocationSizeMax);
+                writer.WriteNumber("UnusedRangeSizeMin", stats.UnusedRangeSizeMin);
+                writer.WriteNumber("UnusedRangeSizeMax", stats.UnusedRangeSizeMax);
+
+                if (detailedMap)
+                {
+                    writer.WritePropertyName("Details");
+                    writer.WriteStartObject();
+                    writer.WritePropertyName("Suballocations");
+                    writer.WriteStartArray();
+
+                    ulong handle = metadata.GetAllocationListBegin();
+                    while (handle != 0)
+                    {
+                        metadata.GetAllocationInfo(handle, out var info);
+                        writer.WriteStartObject();
+                        writer.WriteNumber("Offset", info.Offset);
+                        writer.WriteNumber("Size",   info.Size);
+                        if (info.UserData is string name)
+                            writer.WriteString("UserData", name);
+                        writer.WriteEndObject();
+                        handle = metadata.GetNextAllocation(handle);
+                    }
+
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                }
+
+                writer.WriteEndObject();
+            }
+
+            return Encoding.UTF8.GetString(stream.ToArray());
         }
 
         private VmaBlockMetadata RequireMetadata()

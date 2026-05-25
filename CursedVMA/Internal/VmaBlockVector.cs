@@ -338,18 +338,23 @@ namespace CursedVMA.Internal
         /// <summary>
         /// Tries to fit an allocation of <paramref name="size"/> /
         /// <paramref name="alignment"/> in any existing block other than
-        /// <paramref name="excludeBlock"/>. No new blocks are created.
+        /// <paramref name="excludeBlock"/>. When <paramref name="allowNewBlock"/>
+        /// is true and all existing blocks fail, one new block is created and
+        /// tried (used by the Extensive defrag algorithm). No new blocks are
+        /// created when <paramref name="allowNewBlock"/> is false.
         /// Returns true and fills <paramref name="allocation"/> on success.
         /// </summary>
-        internal bool TryAllocateInExistingBlocks(
+        internal bool TryAllocateForDefrag(
             ulong size,
             ulong alignment,
             VmaSuballocationType suballocType,
             VmaDeviceMemoryBlock excludeBlock,
+            bool allowNewBlock,
             out VmaAllocation? allocation)
         {
             allocation = null;
             ulong effectiveAlignment = Math.Max(alignment, m_MinAllocationAlignment);
+
             lock (m_MutexLock)
             {
                 foreach (var block in m_Blocks)
@@ -360,8 +365,46 @@ namespace CursedVMA.Internal
                         return true;
                 }
             }
+
+            if (!allowNewBlock) return false;
+
+            ulong minBlockForAlloc = size + (effectiveAlignment > 1 ? effectiveAlignment - 1 : 0);
+            ulong newBlockSize = m_ExplicitBlockSize
+                ? m_PreferredBlockSize
+                : Math.Max(m_PreferredBlockSize, minBlockForAlloc);
+            if (CreateBlock(newBlockSize, out _) != Result.Success)
+                return false;
+
+            lock (m_MutexLock)
+            {
+                // The newly created block lands at the end of the list.
+                if (m_Blocks.Count > 0)
+                {
+                    var newest = m_Blocks[m_Blocks.Count - 1];
+                    if (newest != excludeBlock && TryAllocFromBlock(
+                            newest, size, effectiveAlignment,
+                            upperAddress: false, suballocType, strategy: 0, out allocation))
+                        return true;
+                }
+            }
             return false;
         }
+
+
+        /// <summary>
+        /// Tries to fit an allocation of <paramref name="size"/> /
+        /// <paramref name="alignment"/> in any existing block other than
+        /// <paramref name="excludeBlock"/>. No new blocks are created.
+        /// Returns true and fills <paramref name="allocation"/> on success.
+        /// </summary>
+        internal bool TryAllocateInExistingBlocks(
+            ulong size,
+            ulong alignment,
+            VmaSuballocationType suballocType,
+            VmaDeviceMemoryBlock excludeBlock,
+            out VmaAllocation? allocation)
+            => TryAllocateForDefrag(size, alignment, suballocType, excludeBlock,
+                allowNewBlock: false, out allocation);
 
         /// <summary>
         /// Frees <paramref name="allocHandle"/> from <paramref name="block"/>'s

@@ -6,10 +6,17 @@
 //   Dispose    – releases any un-consumed tmp allocations left over if the
 //                caller aborts between BeginPass and EndDefragmentation.
 //
+// Four algorithm modes are supported, selected via VmaDefragmentationInfo.Flags:
+//   Fast       – one source block per vector, chosen by highest free/total ratio.
+//   Balanced   – one source block per vector, chosen by highest absolute free bytes
+//                (default when no algorithm flag is set).
+//   Full       – all blocks with free space per vector per pass, sorted emptiest
+//                first; more allocations moved per pass than Balanced.
+//   Extensive  – like Full but may create a new VkDeviceMemory block when an
+//                allocation cannot fit in any existing block.
+//
 // Only block-backed (non-dedicated) allocations are defragmented. Mapped
-// allocations (MapCount > 0) are skipped. No new blocks are created during
-// a pass; if a source allocation cannot fit in any existing block it is
-// silently omitted from the move list.
+// allocations (MapCount > 0) are skipped.
 
 using CursedVMA.Internal;
 using Silk.NET.Vulkan;
@@ -62,54 +69,65 @@ namespace CursedVMA
             ulong maxBytes  = m_Info.MaxBytesPerPass == 0
                 ? ulong.MaxValue : m_Info.MaxBytesPerPass;
 
-            var moves = new List<VmaDefragmentationMove>();
-            var tmps  = new List<VmaAllocation?>();
-            bool limitReached = false;
+            VmaDefragmentationFlags algo = EffectiveAlgorithm;
+            bool allowNewBlock = algo == VmaDefragmentationFlags.AlgorithmExtensiveBit;
 
+            // Phase 1 – collect candidate (alloc, srcBlock, bv) triples without
+            // touching the metadata. Iterating metadata BEFORE allocating any temp
+            // slots ensures that freshly placed temps are never mistaken for source
+            // allocations when a later source block is processed in the same pass.
+            var candidates = new List<(VmaAllocation alloc,
+                                       VmaDeviceMemoryBlock srcBlock,
+                                       VmaBlockVector bv)>();
+            bool breakRequested = false;
             foreach (var bv in CollectBlockVectors())
             {
-                if (limitReached) break;
-
-                VmaDeviceMemoryBlock? srcBlock = FindSourceBlock(bv.GetBlockSnapshot());
-                if (srcBlock == null) continue;
-
-                ulong handle = srcBlock.Metadata.GetAllocationListBegin();
-                while (handle != 0 && !limitReached)
+                if (breakRequested) break;
+                VmaDeviceMemoryBlock[] snapshot = bv.GetBlockSnapshot();
+                List<VmaDeviceMemoryBlock> sourceBlocks = SelectSourceBlocks(snapshot, algo);
+                foreach (var srcBlock in sourceBlocks)
                 {
-                    var alloc = srcBlock.Metadata.GetAllocationUserData(handle) as VmaAllocation;
-                    // Advance now so continue/break don't skip a handle.
-                    handle = srcBlock.Metadata.GetNextAllocation(handle);
-
-                    if (alloc == null || alloc.MapCount > 0 || alloc.Size > maxBytes)
-                        continue;
-
-                    if ((uint)moves.Count >= maxAllocs)
+                    if (breakRequested) break;
+                    ulong handle = srcBlock.Metadata.GetAllocationListBegin();
+                    while (handle != 0)
                     {
-                        limitReached = true;
-                        break;
-                    }
-
-                    if (m_Info.PfnBreakCallback != null
-                        && m_Info.PfnBreakCallback(m_Info.BreakCallbackUserData))
-                    {
-                        limitReached = true;
-                        break;
-                    }
-
-                    if (bv.TryAllocateInExistingBlocks(
-                            alloc.Size, alloc.Alignment,
-                            VmaSuballocationType.Unknown, srcBlock,
-                            out VmaAllocation? tmp))
-                    {
-                        moves.Add(new VmaDefragmentationMove
+                        var alloc = srcBlock.Metadata.GetAllocationUserData(handle)
+                            as VmaAllocation;
+                        handle = srcBlock.Metadata.GetNextAllocation(handle);
+                        if (alloc == null || alloc.MapCount > 0) continue;
+                        if (m_Info.PfnBreakCallback != null
+                            && m_Info.PfnBreakCallback(m_Info.BreakCallbackUserData))
                         {
-                            Operation        = VmaDefragmentationMoveOperation.Copy,
-                            SrcAllocation    = alloc,
-                            DstTmpAllocation = tmp,
-                        });
-                        tmps.Add(tmp);
-                        maxBytes -= alloc.Size;
+                            breakRequested = true;
+                            break;
+                        }
+                        candidates.Add((alloc, srcBlock, bv));
                     }
+                }
+            }
+
+            // Phase 2 – for each candidate, try to place a temp allocation and
+            // record a Copy move. This runs after all source allocs are snapshotted,
+            // so no freshly-created temp can appear as a source.
+            var moves = new List<VmaDefragmentationMove>();
+            var tmps  = new List<VmaAllocation?>();
+            foreach (var (alloc, srcBlock, bv) in candidates)
+            {
+                if (alloc.Size > maxBytes) continue;
+                if ((uint)moves.Count >= maxAllocs) break;
+
+                if (bv.TryAllocateForDefrag(alloc.Size, alloc.Alignment,
+                        VmaSuballocationType.Unknown, srcBlock,
+                        allowNewBlock, out VmaAllocation? tmp))
+                {
+                    moves.Add(new VmaDefragmentationMove
+                    {
+                        Operation        = VmaDefragmentationMoveOperation.Copy,
+                        SrcAllocation    = alloc,
+                        DstTmpAllocation = tmp,
+                    });
+                    tmps.Add(tmp);
+                    maxBytes -= alloc.Size;
                 }
             }
 
@@ -221,6 +239,51 @@ namespace CursedVMA
 
         // ── Private helpers ──────────────────────────────────────────────────
 
+        // Returns the effective algorithm, defaulting to Balanced when no flag is set.
+        private VmaDefragmentationFlags EffectiveAlgorithm
+        {
+            get
+            {
+                VmaDefragmentationFlags algo =
+                    m_Info.Flags & VmaDefragmentationFlags.AlgorithmMask;
+                return algo == VmaDefragmentationFlags.None
+                    ? VmaDefragmentationFlags.AlgorithmBalancedBit
+                    : algo;
+            }
+        }
+
+        // Returns the ordered list of source blocks for one pass, based on algorithm.
+        private static List<VmaDeviceMemoryBlock> SelectSourceBlocks(
+            VmaDeviceMemoryBlock[] blocks, VmaDefragmentationFlags algo)
+        {
+            if (algo == VmaDefragmentationFlags.AlgorithmFullBit ||
+                algo == VmaDefragmentationFlags.AlgorithmExtensiveBit)
+            {
+                // All non-empty blocks with free space, sorted by descending free bytes.
+                var result = new List<(VmaDeviceMemoryBlock block, ulong freeBytes)>();
+                foreach (var block in blocks)
+                {
+                    if (block.IsEmpty()) continue;
+                    ulong free = block.Metadata.GetSumFreeSize();
+                    if (free > 0) result.Add((block, free));
+                }
+                result.Sort((a, b) => b.freeBytes.CompareTo(a.freeBytes));
+                var ordered = new List<VmaDeviceMemoryBlock>(result.Count);
+                foreach (var (b, _) in result) ordered.Add(b);
+                return ordered;
+            }
+            else
+            {
+                // Fast or Balanced: single block selected by different heuristics.
+                VmaDeviceMemoryBlock? single = algo == VmaDefragmentationFlags.AlgorithmFastBit
+                    ? FindSourceBlockByRatio(blocks)
+                    : FindSourceBlock(blocks);
+                var result = new List<VmaDeviceMemoryBlock>(1);
+                if (single != null) result.Add(single);
+                return result;
+            }
+        }
+
         private void FreePreviousPassTemps()
         {
             if (m_TmpAllocBuffer == null) return;
@@ -270,7 +333,7 @@ namespace CursedVMA
             return result;
         }
 
-        // Returns the non-empty block with the most free bytes (best candidate to drain).
+        // Selects the non-empty block with the most free bytes (Balanced).
         private static VmaDeviceMemoryBlock? FindSourceBlock(VmaDeviceMemoryBlock[] blocks)
         {
             VmaDeviceMemoryBlock? best         = null;
@@ -281,8 +344,30 @@ namespace CursedVMA
                 ulong free = block.Metadata.GetSumFreeSize();
                 if (best == null || free > bestFreeBytes)
                 {
-                    best         = block;
+                    best          = block;
                     bestFreeBytes = free;
+                }
+            }
+            return best;
+        }
+
+        // Selects the non-empty block with the highest free/total ratio (Fast).
+        private static VmaDeviceMemoryBlock? FindSourceBlockByRatio(VmaDeviceMemoryBlock[] blocks)
+        {
+            VmaDeviceMemoryBlock? best      = null;
+            double                bestRatio = 0.0;
+            foreach (var block in blocks)
+            {
+                if (block.IsEmpty()) continue;
+                ulong total = block.Metadata.GetSize();
+                if (total == 0) continue;
+                ulong free = block.Metadata.GetSumFreeSize();
+                if (free == 0) continue;
+                double ratio = (double)free / total;
+                if (ratio > bestRatio)
+                {
+                    bestRatio = ratio;
+                    best      = block;
                 }
             }
             return best;

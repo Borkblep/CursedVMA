@@ -92,6 +92,19 @@ namespace CursedVMA.Internal
             Image image,
             ref MemoryRequirements2 memoryRequirements);
 
+        // VK_KHR_maintenance4 / Vulkan 1.3 core: query requirements directly from
+        // a buffer or image create-info without first creating the resource.
+
+        void GetDeviceBufferMemoryRequirements(
+            Device device,
+            in BufferCreateInfo bufferCreateInfo,
+            ref MemoryRequirements2 memoryRequirements);
+
+        void GetDeviceImageMemoryRequirements(
+            Device device,
+            in ImageCreateInfo imageCreateInfo,
+            ref MemoryRequirements2 memoryRequirements);
+
         // --- Resource lifecycle ---
 
         Result CreateBuffer(

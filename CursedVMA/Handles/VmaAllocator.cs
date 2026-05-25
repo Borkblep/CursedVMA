@@ -394,16 +394,28 @@ namespace CursedVMA
             RequireNotDisposed();
             memoryTypeIndex = uint.MaxValue;
 
-            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
-            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+            MemoryRequirements req;
+            if (UseKhrMaintenance4OrCore13())
+            {
+                // Maintenance4 / Vulkan 1.3 path: query directly from the create-info
+                // without round-tripping a throwaway VkBuffer.
+                var mr2 = new MemoryRequirements2 { SType = StructureType.MemoryRequirements2 };
+                VkFunctions.GetDeviceBufferMemoryRequirements(Device, in bufferCreateInfo, ref mr2);
+                req = mr2.MemoryRequirements;
+            }
+            else
+            {
+                AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+                AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
 
-            Result r = VkFunctions.CreateBuffer(
-                Device, in bufferCreateInfo, pAc, out Silk.NET.Vulkan.Buffer probe);
-            if (r != Result.Success)
-                return r;
+                Result r = VkFunctions.CreateBuffer(
+                    Device, in bufferCreateInfo, pAc, out Silk.NET.Vulkan.Buffer probe);
+                if (r != Result.Success)
+                    return r;
 
-            VkFunctions.GetBufferMemoryRequirements(Device, probe, out MemoryRequirements req);
-            VkFunctions.DestroyBuffer(Device, probe, pAc);
+                VkFunctions.GetBufferMemoryRequirements(Device, probe, out req);
+                VkFunctions.DestroyBuffer(Device, probe, pAc);
+            }
 
             return FindMemoryTypeIndex(
                 req.MemoryTypeBits, in allocationCreateInfo, out memoryTypeIndex);
@@ -424,19 +436,41 @@ namespace CursedVMA
             RequireNotDisposed();
             memoryTypeIndex = uint.MaxValue;
 
-            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
-            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+            MemoryRequirements req;
+            if (UseKhrMaintenance4OrCore13())
+            {
+                var mr2 = new MemoryRequirements2 { SType = StructureType.MemoryRequirements2 };
+                VkFunctions.GetDeviceImageMemoryRequirements(Device, in imageCreateInfo, ref mr2);
+                req = mr2.MemoryRequirements;
+            }
+            else
+            {
+                AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+                AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
 
-            Result r = VkFunctions.CreateImage(
-                Device, in imageCreateInfo, pAc, out Image probe);
-            if (r != Result.Success)
-                return r;
+                Result r = VkFunctions.CreateImage(
+                    Device, in imageCreateInfo, pAc, out Image probe);
+                if (r != Result.Success)
+                    return r;
 
-            VkFunctions.GetImageMemoryRequirements(Device, probe, out MemoryRequirements req);
-            VkFunctions.DestroyImage(Device, probe, pAc);
+                VkFunctions.GetImageMemoryRequirements(Device, probe, out req);
+                VkFunctions.DestroyImage(Device, probe, pAc);
+            }
 
             return FindMemoryTypeIndex(
                 req.MemoryTypeBits, in allocationCreateInfo, out memoryTypeIndex);
+        }
+
+        // Returns true when the maintenance4 / Vulkan 1.3 fast path can be used
+        // to query memory requirements directly from a create-info, avoiding the
+        // throwaway create/destroy probe pair.
+        private bool UseKhrMaintenance4OrCore13()
+        {
+            const uint VkApiVersion1_3 = (1u << 22) | (3u << 12); // VK_API_VERSION_1_3
+            bool flagSet =
+                (Flags & VmaAllocatorCreateFlags.KhrMaintenance4Bit) != 0 ||
+                (Flags & VmaAllocatorCreateFlags.KhrMaintenance5Bit) != 0;
+            return flagSet || VulkanApiVersion >= VkApiVersion1_3;
         }
 
         /// <summary>

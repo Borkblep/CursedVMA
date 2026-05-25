@@ -13,11 +13,16 @@ namespace CursedVMA.Internal
     {
         private readonly Vk m_Vk;
         private readonly KhrBindMemory2? m_KhrBindMemory2;
+        private readonly KhrMaintenance4? m_KhrMaintenance4;
 
-        internal VmaVulkanFunctions(Vk vk, KhrBindMemory2? khrBindMemory2 = null)
+        internal VmaVulkanFunctions(
+            Vk vk,
+            KhrBindMemory2? khrBindMemory2 = null,
+            KhrMaintenance4? khrMaintenance4 = null)
         {
             m_Vk = vk;
             m_KhrBindMemory2 = khrBindMemory2;
+            m_KhrMaintenance4 = khrMaintenance4;
         }
 
         public Result AllocateMemory(
@@ -148,6 +153,52 @@ namespace CursedVMA.Internal
             m_Vk.GetImageMemoryRequirements2(
                 device, &info,
                 (MemoryRequirements2*)Unsafe.AsPointer(ref memoryRequirements));
+        }
+
+        public unsafe void GetDeviceBufferMemoryRequirements(
+            Device device,
+            in BufferCreateInfo bufferCreateInfo,
+            ref MemoryRequirements2 memoryRequirements)
+        {
+            fixed (BufferCreateInfo* pCreateInfo = &bufferCreateInfo)
+            {
+                var info = new DeviceBufferMemoryRequirements
+                {
+                    SType       = StructureType.DeviceBufferMemoryRequirements,
+                    PCreateInfo = pCreateInfo,
+                };
+                if (m_KhrMaintenance4 != null)
+                    m_KhrMaintenance4.GetDeviceBufferMemoryRequirements(
+                        device, &info,
+                        (MemoryRequirements2*)Unsafe.AsPointer(ref memoryRequirements));
+                else
+                    m_Vk.GetDeviceBufferMemoryRequirements(
+                        device, &info,
+                        (MemoryRequirements2*)Unsafe.AsPointer(ref memoryRequirements));
+            }
+        }
+
+        public unsafe void GetDeviceImageMemoryRequirements(
+            Device device,
+            in ImageCreateInfo imageCreateInfo,
+            ref MemoryRequirements2 memoryRequirements)
+        {
+            fixed (ImageCreateInfo* pCreateInfo = &imageCreateInfo)
+            {
+                var info = new DeviceImageMemoryRequirements
+                {
+                    SType       = StructureType.DeviceImageMemoryRequirements,
+                    PCreateInfo = pCreateInfo,
+                };
+                if (m_KhrMaintenance4 != null)
+                    m_KhrMaintenance4.GetDeviceImageMemoryRequirements(
+                        device, &info,
+                        (MemoryRequirements2*)Unsafe.AsPointer(ref memoryRequirements));
+                else
+                    m_Vk.GetDeviceImageMemoryRequirements(
+                        device, &info,
+                        (MemoryRequirements2*)Unsafe.AsPointer(ref memoryRequirements));
+            }
         }
 
         public void GetPhysicalDeviceMemoryProperties(

@@ -191,6 +191,8 @@ namespace CursedVMA.Tests
 
         public int GetBufferMemoryRequirements2CallCount;
         public int GetImageMemoryRequirements2CallCount;
+        public int GetDeviceBufferMemoryRequirementsCallCount;
+        public int GetDeviceImageMemoryRequirementsCallCount;
 
         public unsafe void GetBufferMemoryRequirements2(
             Device device, Silk.NET.Vulkan.Buffer buffer, ref MemoryRequirements2 r)
@@ -240,6 +242,24 @@ namespace CursedVMA.Tests
                 }
                 pNext = *(void**)((byte*)pNext + 8);
             }
+        }
+
+        public unsafe void GetDeviceBufferMemoryRequirements(
+            Device device,
+            in BufferCreateInfo bufferCreateInfo,
+            ref MemoryRequirements2 memoryRequirements)
+        {
+            GetDeviceBufferMemoryRequirementsCallCount++;
+            memoryRequirements.MemoryRequirements = BufferMemoryRequirements;
+        }
+
+        public unsafe void GetDeviceImageMemoryRequirements(
+            Device device,
+            in ImageCreateInfo imageCreateInfo,
+            ref MemoryRequirements2 memoryRequirements)
+        {
+            GetDeviceImageMemoryRequirementsCallCount++;
+            memoryRequirements.MemoryRequirements = ImageMemoryRequirements;
         }
 
         public void GetPhysicalDeviceMemoryProperties(

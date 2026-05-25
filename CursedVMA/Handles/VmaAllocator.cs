@@ -459,36 +459,104 @@ namespace CursedVMA
         }
 
         /// <summary>
-        /// Queries <c>vkGetBufferMemoryRequirements</c> and allocates memory
-        /// suitable for binding to <paramref name="buffer"/>. Equivalent to
+        /// Queries <c>vkGetBufferMemoryRequirements</c> (or the KHR dedicated
+        /// variant when <see cref="VmaAllocatorCreateFlags.KhrDedicatedAllocationBit"/>
+        /// is set) and allocates memory suitable for binding to
+        /// <paramref name="buffer"/>. Equivalent to
         /// <c>vmaAllocateMemoryForBuffer</c>.
         /// </summary>
-        public Result AllocateMemoryForBuffer(
+        public unsafe Result AllocateMemoryForBuffer(
             Silk.NET.Vulkan.Buffer buffer,
             in VmaAllocationCreateInfo createInfo,
             out VmaAllocation? allocation)
         {
             RequireNotDisposed();
-            VkFunctions.GetBufferMemoryRequirements(Device, buffer, out MemoryRequirements req);
+
+            MemoryRequirements req;
+            bool requiresDedicated = false;
+            bool prefersDedicated  = false;
+
+            if ((Flags & VmaAllocatorCreateFlags.KhrDedicatedAllocationBit) != 0)
+            {
+                var dedicatedReqs = new MemoryDedicatedRequirements
+                {
+                    SType = StructureType.MemoryDedicatedRequirements,
+                };
+                var reqs2 = new MemoryRequirements2
+                {
+                    SType = StructureType.MemoryRequirements2,
+                    PNext = &dedicatedReqs,
+                };
+                VkFunctions.GetBufferMemoryRequirements2(Device, buffer, ref reqs2);
+                req               = reqs2.MemoryRequirements;
+                requiresDedicated = dedicatedReqs.RequiresDedicatedAllocation;
+                prefersDedicated  = dedicatedReqs.PrefersDedicatedAllocation;
+            }
+            else
+            {
+                VkFunctions.GetBufferMemoryRequirements(Device, buffer, out req);
+            }
+
+            var effectiveCreateInfo = createInfo;
+            if (requiresDedicated)
+                effectiveCreateInfo.Flags |= VmaAllocationCreateFlags.DedicatedMemoryBit;
+            else if (prefersDedicated &&
+                     (createInfo.Flags & VmaAllocationCreateFlags.CanAliasBit) == 0)
+                effectiveCreateInfo.Flags |= VmaAllocationCreateFlags.DedicatedMemoryBit;
+
             return AllocateMemoryInternal(
-                in req, VmaSuballocationType.Buffer, in createInfo, out allocation);
+                in req, VmaSuballocationType.Buffer, in effectiveCreateInfo, out allocation);
         }
 
         /// <summary>
-        /// Queries <c>vkGetImageMemoryRequirements</c> and allocates memory
-        /// suitable for binding to <paramref name="image"/>. Uses
+        /// Queries <c>vkGetImageMemoryRequirements</c> (or the KHR dedicated
+        /// variant when <see cref="VmaAllocatorCreateFlags.KhrDedicatedAllocationBit"/>
+        /// is set) and allocates memory suitable for binding to
+        /// <paramref name="image"/>. Uses
         /// <see cref="VmaSuballocationType.ImageOptimal"/> (the common case).
         /// Equivalent to <c>vmaAllocateMemoryForImage</c>.
         /// </summary>
-        public Result AllocateMemoryForImage(
+        public unsafe Result AllocateMemoryForImage(
             Image image,
             in VmaAllocationCreateInfo createInfo,
             out VmaAllocation? allocation)
         {
             RequireNotDisposed();
-            VkFunctions.GetImageMemoryRequirements(Device, image, out MemoryRequirements req);
+
+            MemoryRequirements req;
+            bool requiresDedicated = false;
+            bool prefersDedicated  = false;
+
+            if ((Flags & VmaAllocatorCreateFlags.KhrDedicatedAllocationBit) != 0)
+            {
+                var dedicatedReqs = new MemoryDedicatedRequirements
+                {
+                    SType = StructureType.MemoryDedicatedRequirements,
+                };
+                var reqs2 = new MemoryRequirements2
+                {
+                    SType = StructureType.MemoryRequirements2,
+                    PNext = &dedicatedReqs,
+                };
+                VkFunctions.GetImageMemoryRequirements2(Device, image, ref reqs2);
+                req               = reqs2.MemoryRequirements;
+                requiresDedicated = dedicatedReqs.RequiresDedicatedAllocation;
+                prefersDedicated  = dedicatedReqs.PrefersDedicatedAllocation;
+            }
+            else
+            {
+                VkFunctions.GetImageMemoryRequirements(Device, image, out req);
+            }
+
+            var effectiveCreateInfo = createInfo;
+            if (requiresDedicated)
+                effectiveCreateInfo.Flags |= VmaAllocationCreateFlags.DedicatedMemoryBit;
+            else if (prefersDedicated &&
+                     (createInfo.Flags & VmaAllocationCreateFlags.CanAliasBit) == 0)
+                effectiveCreateInfo.Flags |= VmaAllocationCreateFlags.DedicatedMemoryBit;
+
             return AllocateMemoryInternal(
-                in req, VmaSuballocationType.ImageOptimal, in createInfo, out allocation);
+                in req, VmaSuballocationType.ImageOptimal, in effectiveCreateInfo, out allocation);
         }
 
         /// <summary>
@@ -1174,6 +1242,61 @@ namespace CursedVMA
         }
 
         /// <summary>
+        /// Like <see cref="CreateBuffer"/> but enforces an additional minimum
+        /// alignment on the resulting allocation. The effective alignment is
+        /// <c>max(allocationCreateInfo.MinAlignment, minAlignment)</c>.
+        /// Equivalent to <c>vmaCreateBufferWithAlignment</c>.
+        /// </summary>
+        public unsafe Result CreateBufferWithAlignment(
+            in BufferCreateInfo bufferCreateInfo,
+            in VmaAllocationCreateInfo allocationCreateInfo,
+            ulong minAlignment,
+            out Silk.NET.Vulkan.Buffer buffer,
+            out VmaAllocation? allocation,
+            out VmaAllocationInfo allocationInfo)
+        {
+            RequireNotDisposed();
+            buffer         = default;
+            allocation     = null;
+            allocationInfo = default;
+
+            AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
+            AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
+
+            Result r = VkFunctions.CreateBuffer(Device, in bufferCreateInfo, pAc, out buffer);
+            if (r != Result.Success)
+                return r;
+
+            var effectiveCreateInfo = allocationCreateInfo;
+            effectiveCreateInfo.MinAlignment =
+                Math.Max(allocationCreateInfo.MinAlignment, minAlignment);
+
+            r = AllocateMemoryForBuffer(buffer, in effectiveCreateInfo, out allocation);
+            if (r != Result.Success)
+            {
+                VkFunctions.DestroyBuffer(Device, buffer, pAc);
+                buffer = default;
+                return r;
+            }
+
+            if ((allocationCreateInfo.Flags & VmaAllocationCreateFlags.DontBindBit) == 0)
+            {
+                r = BindBufferMemory(allocation!, buffer);
+                if (r != Result.Success)
+                {
+                    FreeMemory(allocation);
+                    VkFunctions.DestroyBuffer(Device, buffer, pAc);
+                    buffer     = default;
+                    allocation = null;
+                    return r;
+                }
+            }
+
+            allocation!.GetInfo(out allocationInfo);
+            return Result.Success;
+        }
+
+        /// <summary>
         /// Creates a <c>VkImage</c>, allocates memory for it, and binds the
         /// image to that memory. On failure all partial state is rolled back.
         /// Equivalent to <c>vmaCreateImage</c>.
@@ -1677,6 +1800,17 @@ namespace CursedVMA
             // DedicatedMemoryBit is invalid here per VMA's contract; ignored.
             if (createInfo.Pool != null)
             {
+                if ((createInfo.Flags & VmaAllocationCreateFlags.WithinBudgetBit) != 0)
+                {
+                    uint poolHeap = GetMemoryType(
+                        createInfo.Pool.BlockVector.MemoryTypeIndex).HeapIndex;
+                    Span<VmaBudget> poolBudgets = stackalloc VmaBudget[(int)MemoryHeapCount];
+                    GetHeapBudgets(poolBudgets);
+                    if (poolBudgets[(int)poolHeap].Usage + vkMemReq.Size >
+                        poolBudgets[(int)poolHeap].Budget)
+                        return Result.ErrorOutOfDeviceMemory;
+                }
+
                 Result pr = createInfo.Pool.BlockVector.AllocatePage(
                     vkMemReq.Size, alignment,
                     createInfo.Flags, suballocType, out allocation);
@@ -1690,6 +1824,17 @@ namespace CursedVMA
                 out uint memTypeIndex);
             if (r != Result.Success)
                 return r;
+
+            // Enforce WithinBudgetBit: reject if usage + requested size > budget.
+            if ((createInfo.Flags & VmaAllocationCreateFlags.WithinBudgetBit) != 0)
+            {
+                uint heapIndex = GetMemoryType(memTypeIndex).HeapIndex;
+                Span<VmaBudget> budgets = stackalloc VmaBudget[(int)MemoryHeapCount];
+                GetHeapBudgets(budgets);
+                if (budgets[(int)heapIndex].Usage + vkMemReq.Size >
+                    budgets[(int)heapIndex].Budget)
+                    return Result.ErrorOutOfDeviceMemory;
+            }
 
             // Dedicated path bypasses the block vector entirely.
             if ((createInfo.Flags & VmaAllocationCreateFlags.DedicatedMemoryBit) != 0)
@@ -1978,6 +2123,9 @@ namespace CursedVMA
         {
             if (createInfo.UserData != null)
                 allocation.UserData = createInfo.UserData;
+
+            allocation.CanAlias =
+                (createInfo.Flags & VmaAllocationCreateFlags.CanAliasBit) != 0;
 
             if ((createInfo.Flags & VmaAllocationCreateFlags.MappedBit) != 0)
             {

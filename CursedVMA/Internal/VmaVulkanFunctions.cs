@@ -120,6 +120,36 @@ namespace CursedVMA.Internal
             memoryRequirements = r;
         }
 
+        public unsafe void GetBufferMemoryRequirements2(
+            Device device,
+            Silk.NET.Vulkan.Buffer buffer,
+            ref MemoryRequirements2 memoryRequirements)
+        {
+            var info = new BufferMemoryRequirementsInfo2
+            {
+                SType  = StructureType.BufferMemoryRequirementsInfo2,
+                Buffer = buffer,
+            };
+            m_Vk.GetBufferMemoryRequirements2(
+                device, &info,
+                (MemoryRequirements2*)Unsafe.AsPointer(ref memoryRequirements));
+        }
+
+        public unsafe void GetImageMemoryRequirements2(
+            Device device,
+            Image image,
+            ref MemoryRequirements2 memoryRequirements)
+        {
+            var info = new ImageMemoryRequirementsInfo2
+            {
+                SType = StructureType.ImageMemoryRequirementsInfo2,
+                Image = image,
+            };
+            m_Vk.GetImageMemoryRequirements2(
+                device, &info,
+                (MemoryRequirements2*)Unsafe.AsPointer(ref memoryRequirements));
+        }
+
         public void GetPhysicalDeviceMemoryProperties(
             PhysicalDevice physicalDevice,
             out PhysicalDeviceMemoryProperties memoryProperties)

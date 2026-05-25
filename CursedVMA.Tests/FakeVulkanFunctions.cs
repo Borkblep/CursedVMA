@@ -185,6 +185,63 @@ namespace CursedVMA.Tests
             Device device, Image image, out MemoryRequirements r)
             => r = ImageMemoryRequirements;
 
+        // Configurable dedicated requirements returned via pNext chain.
+        public bool FakeDedicatedRequires = false;
+        public bool FakeDedicatedPrefers  = false;
+
+        public int GetBufferMemoryRequirements2CallCount;
+        public int GetImageMemoryRequirements2CallCount;
+
+        public unsafe void GetBufferMemoryRequirements2(
+            Device device, Silk.NET.Vulkan.Buffer buffer, ref MemoryRequirements2 r)
+        {
+            GetBufferMemoryRequirements2CallCount++;
+            r.MemoryRequirements = BufferMemoryRequirements;
+            void* pNext = r.PNext;
+            while (pNext != null)
+            {
+                if (*(StructureType*)pNext == StructureType.MemoryDedicatedRequirements)
+                {
+                    var dr = (MemoryDedicatedRequirements*)pNext;
+                    void* savedNext = dr->PNext;
+                    *dr = new MemoryDedicatedRequirements
+                    {
+                        SType = StructureType.MemoryDedicatedRequirements,
+                        PNext = savedNext,
+                        PrefersDedicatedAllocation  = FakeDedicatedPrefers,
+                        RequiresDedicatedAllocation = FakeDedicatedRequires,
+                    };
+                    break;
+                }
+                pNext = *(void**)((byte*)pNext + 8);
+            }
+        }
+
+        public unsafe void GetImageMemoryRequirements2(
+            Device device, Image image, ref MemoryRequirements2 r)
+        {
+            GetImageMemoryRequirements2CallCount++;
+            r.MemoryRequirements = ImageMemoryRequirements;
+            void* pNext = r.PNext;
+            while (pNext != null)
+            {
+                if (*(StructureType*)pNext == StructureType.MemoryDedicatedRequirements)
+                {
+                    var dr = (MemoryDedicatedRequirements*)pNext;
+                    void* savedNext = dr->PNext;
+                    *dr = new MemoryDedicatedRequirements
+                    {
+                        SType = StructureType.MemoryDedicatedRequirements,
+                        PNext = savedNext,
+                        PrefersDedicatedAllocation  = FakeDedicatedPrefers,
+                        RequiresDedicatedAllocation = FakeDedicatedRequires,
+                    };
+                    break;
+                }
+                pNext = *(void**)((byte*)pNext + 8);
+            }
+        }
+
         public void GetPhysicalDeviceMemoryProperties(
             PhysicalDevice pd, out PhysicalDeviceMemoryProperties r)
             => r = MemoryProperties;

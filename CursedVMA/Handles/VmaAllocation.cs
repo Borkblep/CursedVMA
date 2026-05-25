@@ -36,6 +36,9 @@ namespace CursedVMA
         private object? m_UserData;
         private string? m_Name;
 
+        // Set when VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT was specified.
+        private bool m_CanAlias;
+
         // Mapping state. For block allocations m_pMappedData is the cached
         // (block.MappedData + offset). For dedicated it is the result of the
         // direct vkMapMemory call. Either way, m_MapCount is the per-allocation
@@ -227,6 +230,15 @@ namespace CursedVMA
         }
 
         // ── Public surface ────────────────────────────────────────────────────
+
+        /// <summary>True when the allocation was created with
+        /// <see cref="VmaAllocationCreateFlags.CanAliasBit"/>, indicating it may
+        /// share its memory range with other aliasing allocations.</summary>
+        public bool CanAlias
+        {
+            get => m_CanAlias;
+            internal set => m_CanAlias = value;
+        }
 
         /// <summary>Index of the Vulkan memory type backing this allocation.</summary>
         public uint MemoryTypeIndex => m_MemoryTypeIndex;

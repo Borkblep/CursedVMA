@@ -82,6 +82,16 @@ namespace CursedVMA.Internal
             Image image,
             out MemoryRequirements memoryRequirements);
 
+        void GetBufferMemoryRequirements2(
+            Device device,
+            Silk.NET.Vulkan.Buffer buffer,
+            ref MemoryRequirements2 memoryRequirements);
+
+        void GetImageMemoryRequirements2(
+            Device device,
+            Image image,
+            ref MemoryRequirements2 memoryRequirements);
+
         // --- Resource lifecycle ---
 
         Result CreateBuffer(

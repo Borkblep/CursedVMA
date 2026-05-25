@@ -66,6 +66,18 @@ namespace CursedVMA
         private readonly long[] m_HeapBytes;
         private readonly ulong[] m_HeapSizeLimit;
 
+        // Per-memory-type ExternalMemoryHandleTypeFlags copied from
+        // VmaAllocatorCreateInfo.TypeExternalMemoryHandleTypes. When a slot is
+        // non-zero, allocations from that memory type get a VkExportMemoryAllocateInfo
+        // entry threaded into their pNext chain. Null if no array was supplied.
+        private readonly ExternalMemoryHandleTypeFlags[]? m_TypeExternalMemoryHandleTypes;
+
+        // Bitmask of memory types eligible for selection, computed once at
+        // construction. Excludes VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD types
+        // unless AmdDeviceCoherentMemoryBit is enabled. Mirrors VMA's
+        // m_GlobalMemoryTypeBits.
+        private readonly uint m_GlobalMemoryTypeBits;
+
         // Optional callbacks invoked after every vkAllocateMemory and before
         // every vkFreeMemory. Mirrors VmaDeviceMemoryCallbacks in C++ VMA.
         private readonly VmaDeviceMemoryCallbacks? m_DeviceMemoryCallbacks;
@@ -88,6 +100,7 @@ namespace CursedVMA
             ulong preferredLargeHeapBlockSize,
             ulong[]? heapSizeLimit,
             VmaDeviceMemoryCallbacks? deviceMemoryCallbacks,
+            ExternalMemoryHandleTypeFlags[]? typeExternalMemoryHandleTypes,
             ulong debugMargin = 0)
         {
             VkFunctions = vkFunctions;
@@ -116,6 +129,48 @@ namespace CursedVMA
                               : ulong.MaxValue;
                 m_HeapSizeLimit[h] = Math.Min(real, limit);
             }
+
+            if (typeExternalMemoryHandleTypes != null)
+            {
+                m_TypeExternalMemoryHandleTypes =
+                    new ExternalMemoryHandleTypeFlags[memoryProperties.MemoryTypeCount];
+                int copy = Math.Min(typeExternalMemoryHandleTypes.Length,
+                                    m_TypeExternalMemoryHandleTypes.Length);
+                Array.Copy(typeExternalMemoryHandleTypes, m_TypeExternalMemoryHandleTypes, copy);
+            }
+
+            m_GlobalMemoryTypeBits = CalculateGlobalMemoryTypeBits(memoryProperties, flags);
+        }
+
+        // Mirrors VmaAllocator_T::CalculateGlobalMemoryTypeBits. When the AMD
+        // device-coherent extension flag is NOT enabled, memory types that carry
+        // VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD must be filtered out of every
+        // selection — VMA refuses to use them implicitly because they have
+        // significant performance implications.
+        private static uint CalculateGlobalMemoryTypeBits(
+            PhysicalDeviceMemoryProperties memProps, VmaAllocatorCreateFlags flags)
+        {
+            uint result = uint.MaxValue;
+            if ((flags & VmaAllocatorCreateFlags.AmdDeviceCoherentMemoryBit) == 0)
+            {
+                for (uint i = 0; i < memProps.MemoryTypeCount; i++)
+                {
+                    if ((memProps.MemoryTypes[(int)i].PropertyFlags
+                            & MemoryPropertyFlags.DeviceCoherentBitAmd) != 0)
+                        result &= ~(1u << (int)i);
+                }
+            }
+            return result;
+        }
+
+        // Returns the external-memory handle types configured for
+        // <paramref name="memoryTypeIndex"/>, or 0 when none were supplied.
+        internal ExternalMemoryHandleTypeFlags GetExternalMemoryHandleTypes(uint memoryTypeIndex)
+        {
+            if (m_TypeExternalMemoryHandleTypes == null
+                || memoryTypeIndex >= m_TypeExternalMemoryHandleTypes.Length)
+                return 0;
+            return m_TypeExternalMemoryHandleTypes[memoryTypeIndex];
         }
 
         /// <summary>
@@ -187,6 +242,7 @@ namespace CursedVMA
                 preferredLargeBlockSize,
                 createInfo.HeapSizeLimit,
                 createInfo.DeviceMemoryCallbacks,
+                createInfo.TypeExternalMemoryHandleTypes,
                 createInfo.DebugMargin);
 
             for (uint i = 0; i < memProps.MemoryTypeCount; i++)
@@ -348,7 +404,9 @@ namespace CursedVMA
             uint filter = allocationCreateInfo.MemoryTypeBits == 0
                 ? uint.MaxValue
                 : allocationCreateInfo.MemoryTypeBits;
-            uint candidates = memoryTypeBits & filter;
+            // m_GlobalMemoryTypeBits removes AMD device-coherent types when the
+            // corresponding allocator flag is not set.
+            uint candidates = memoryTypeBits & filter & m_GlobalMemoryTypeBits;
 
             UsageToFlags(in allocationCreateInfo,
                 out MemoryPropertyFlags required, out MemoryPropertyFlags preferred);
@@ -1910,9 +1968,24 @@ namespace CursedVMA
             AllocationCallbacks ac = AllocatorCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = AllocatorCallbacks.HasValue ? &ac : null;
 
-            // Build pNext chain: MemoryAllocateFlagsInfo (device address) and
+            // Build pNext chain: ExportMemoryAllocateInfo (per-memory-type
+            // external handle), MemoryAllocateFlagsInfo (device address), and
             // MemoryPriorityAllocateInfoEXT, with priority at the head.
             nint pNextChain = 0;
+
+            ExportMemoryAllocateInfo exportInfo = default;
+            ExternalMemoryHandleTypeFlags handleTypes =
+                GetExternalMemoryHandleTypes(memoryTypeIndex);
+            if (handleTypes != 0)
+            {
+                exportInfo = new ExportMemoryAllocateInfo
+                {
+                    SType       = StructureType.ExportMemoryAllocateInfo,
+                    PNext       = (void*)pNextChain,
+                    HandleTypes = handleTypes,
+                };
+                pNextChain = (nint)(&exportInfo);
+            }
 
             MemoryAllocateFlagsInfo flagsInfo = default;
             if ((Flags & VmaAllocatorCreateFlags.BufferDeviceAddressBit) != 0)

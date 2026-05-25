@@ -40,6 +40,14 @@ namespace CursedVMA.Tests
         // AllocateMemory call; null when pNext was null.
         public StructureType? LastAllocatePNextSType;
 
+        // HandleTypes copied from the first ExportMemoryAllocateInfo found in
+        // the pNext chain of the most recent AllocateMemory call. Default (0)
+        // when no such struct was present.
+        public ExternalMemoryHandleTypeFlags LastAllocateExportHandleTypes;
+
+        // Memory type index passed to the most recent AllocateMemory call.
+        public uint LastAllocateMemoryTypeIndex;
+
         // Configurable return values for failure-path tests.
         public Result AllocateMemoryResult = Result.Success;
         public Result CreateBufferResult   = Result.Success;
@@ -66,9 +74,26 @@ namespace CursedVMA.Tests
             out DeviceMemory memory)
         {
             AllocateMemoryCallCount++;
+            LastAllocateMemoryTypeIndex = allocateInfo.MemoryTypeIndex;
             LastAllocatePNextSType = allocateInfo.PNext != null
                 ? *(StructureType*)allocateInfo.PNext
                 : (StructureType?)null;
+
+            // Walk the pNext chain looking for an ExportMemoryAllocateInfo.
+            LastAllocateExportHandleTypes = 0;
+            void* p = allocateInfo.PNext;
+            while (p != null)
+            {
+                if (*(StructureType*)p == StructureType.ExportMemoryAllocateInfo)
+                {
+                    LastAllocateExportHandleTypes =
+                        ((ExportMemoryAllocateInfo*)p)->HandleTypes;
+                    break;
+                }
+                // PNext field follows SType (4 bytes) + 4 bytes padding on 64-bit.
+                p = *(void**)((byte*)p + 8);
+            }
+
             if (AllocateMemoryResult != Result.Success)
             {
                 memory = default;

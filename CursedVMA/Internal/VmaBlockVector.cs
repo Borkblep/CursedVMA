@@ -134,10 +134,26 @@ namespace CursedVMA.Internal
             AllocationCallbacks ac = m_AllocationCallbacks.GetValueOrDefault();
             AllocationCallbacks* pAc = m_AllocationCallbacks.HasValue ? &ac : null;
 
-            // Build pNext chain: MemoryAllocateFlagsInfo (device address) and
+            // Build pNext chain: ExportMemoryAllocateInfo (per-memory-type
+            // external handle), MemoryAllocateFlagsInfo (device address), and
             // MemoryPriorityAllocateInfoEXT, each pointing to the next in line,
             // with the user's m_pMemoryAllocateNext at the tail.
             nint pNextChain = m_pMemoryAllocateNext;
+
+            ExportMemoryAllocateInfo exportInfo = default;
+            ExternalMemoryHandleTypeFlags handleTypes = m_Allocator != null
+                ? m_Allocator.GetExternalMemoryHandleTypes(m_MemoryTypeIndex)
+                : 0;
+            if (handleTypes != 0)
+            {
+                exportInfo = new ExportMemoryAllocateInfo
+                {
+                    SType       = StructureType.ExportMemoryAllocateInfo,
+                    PNext       = (void*)pNextChain,
+                    HandleTypes = handleTypes,
+                };
+                pNextChain = (nint)(&exportInfo);
+            }
 
             MemoryAllocateFlagsInfo flagsInfo = default;
             if (m_Allocator != null

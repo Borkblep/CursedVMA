@@ -5,6 +5,7 @@
 
 using CursedVMA.Internal;
 using Silk.NET.Vulkan;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace CursedVMA.Tests
@@ -48,6 +49,17 @@ namespace CursedVMA.Tests
         // Memory type index passed to the most recent AllocateMemory call.
         public uint LastAllocateMemoryTypeIndex;
 
+        // SType chain of the most recent AllocateMemory call, in walk order
+        // starting from VkMemoryAllocateInfo.pNext. Empty when pNext was null.
+        // Used to assert exact ordering when multiple structs are chained.
+        public readonly List<StructureType> LastAllocatePNextChainTypes = new List<StructureType>();
+
+        // Countdown of AllocateMemory calls that should succeed before
+        // AllocateMemoryResult takes effect. int.MaxValue (default) disables the
+        // countdown — every call obeys AllocateMemoryResult directly. Used by
+        // partial-rollback tests that need the Nth call to fail.
+        public int AllocateMemorySucceedCount = int.MaxValue;
+
         // Configurable return values for failure-path tests.
         public Result AllocateMemoryResult = Result.Success;
         public Result CreateBufferResult   = Result.Success;
@@ -79,19 +91,33 @@ namespace CursedVMA.Tests
                 ? *(StructureType*)allocateInfo.PNext
                 : (StructureType?)null;
 
-            // Walk the pNext chain looking for an ExportMemoryAllocateInfo.
+            // Walk the pNext chain once: record every SType in order and grab
+            // the ExportMemoryAllocateInfo.HandleTypes if present.
+            LastAllocatePNextChainTypes.Clear();
             LastAllocateExportHandleTypes = 0;
             void* p = allocateInfo.PNext;
             while (p != null)
             {
-                if (*(StructureType*)p == StructureType.ExportMemoryAllocateInfo)
-                {
+                StructureType st = *(StructureType*)p;
+                LastAllocatePNextChainTypes.Add(st);
+                if (st == StructureType.ExportMemoryAllocateInfo)
                     LastAllocateExportHandleTypes =
                         ((ExportMemoryAllocateInfo*)p)->HandleTypes;
-                    break;
-                }
                 // PNext field follows SType (4 bytes) + 4 bytes padding on 64-bit.
                 p = *(void**)((byte*)p + 8);
+            }
+
+            // Countdown-based partial-failure mode: succeed the first N calls,
+            // then start returning AllocateMemoryResult. Default int.MaxValue
+            // disables the countdown.
+            if (AllocateMemorySucceedCount > 0)
+                AllocateMemorySucceedCount--;
+            else if (AllocateMemoryResult == Result.Success)
+            {
+                // Countdown exhausted but no explicit failure code: synthesize
+                // an OOM so tests don't have to set both fields.
+                memory = default;
+                return Result.ErrorOutOfDeviceMemory;
             }
 
             if (AllocateMemoryResult != Result.Success)

@@ -340,7 +340,7 @@ namespace CursedVMA.Tests
         }
 
         [Fact]
-        public void AllocateMemoryPages_OnePartialFailure_AllRolledBack()
+        public void AllocateMemoryPages_AllFail_ReturnsErrorWithNoAllocationsToRollBack()
         {
             var (vk, allocator) = MakeAllocator();
             using var __ = allocator;
@@ -357,19 +357,7 @@ namespace CursedVMA.Tests
                     Flags = VmaAllocationCreateFlags.DedicatedMemoryBit,
                 };
             }
-
-            // Trip a failure on the 3rd vkAllocateMemory call.
-            int callIndex = 0;
-            // Simulate by setting AllocateMemoryResult before the 3rd call is hard;
-            // instead we make a wrapper around the FakeVulkanFunctions. Simpler:
-            // fail the type-bits to make the 3rd request unsatisfiable. But all
-            // requests are identical. So toggle AllocateMemoryResult mid-test by
-            // using a fail-after counter via a sub-fake.
-
-            // For simplicity, just check the all-or-nothing wiring directly:
-            // pre-fail vkAllocateMemory and observe no allocations remain.
             vk.AllocateMemoryResult = Result.ErrorOutOfDeviceMemory;
-            outs[0] = outs[1] = outs[2] = null;
 
             Result r = allocator.AllocateMemoryPages(reqs, cis, outs);
 
@@ -377,10 +365,95 @@ namespace CursedVMA.Tests
             Assert.Null(outs[0]);
             Assert.Null(outs[1]);
             Assert.Null(outs[2]);
-            // The function returned before any successful allocations; nothing to roll back.
+            // First call already failed; nothing to roll back.
+            Assert.Equal(0, vk.FreeMemoryCallCount);
+        }
+
+        [Fact]
+        public void AllocateMemoryPages_SecondPageFails_FirstPageIsFreed()
+        {
+            var (vk, allocator) = MakeAllocator();
+            using var __ = allocator;
+
+            // Succeed once, fail the second call.
+            vk.AllocateMemorySucceedCount = 1;
+
+            var reqs = new MemoryRequirements[2];
+            var cis  = new VmaAllocationCreateInfo[2];
+            var outs = new VmaAllocation?[2];
+            for (int i = 0; i < 2; i++)
+            {
+                reqs[i] = new MemoryRequirements { Size = 1024, Alignment = 1, MemoryTypeBits = 1u };
+                cis[i]  = new VmaAllocationCreateInfo
+                {
+                    Flags = VmaAllocationCreateFlags.DedicatedMemoryBit,
+                };
+            }
+
+            Result r = allocator.AllocateMemoryPages(reqs, cis, outs);
+
+            Assert.NotEqual(Result.Success, r);
+            Assert.Null(outs[0]);
+            Assert.Null(outs[1]);
+            // The first dedicated allocation succeeded and must have been freed
+            // during rollback.
+            Assert.Equal(1, vk.FreeMemoryCallCount);
+        }
+
+        [Fact]
+        public void AllocateMemoryPages_ThirdPageFails_FirstTwoPagesAreFreed()
+        {
+            var (vk, allocator) = MakeAllocator();
+            using var __ = allocator;
+
+            vk.AllocateMemorySucceedCount = 2;
+
+            var reqs = new MemoryRequirements[3];
+            var cis  = new VmaAllocationCreateInfo[3];
+            var outs = new VmaAllocation?[3];
+            for (int i = 0; i < 3; i++)
+            {
+                reqs[i] = new MemoryRequirements { Size = 1024, Alignment = 1, MemoryTypeBits = 1u };
+                cis[i]  = new VmaAllocationCreateInfo
+                {
+                    Flags = VmaAllocationCreateFlags.DedicatedMemoryBit,
+                };
+            }
+
+            Result r = allocator.AllocateMemoryPages(reqs, cis, outs);
+
+            Assert.NotEqual(Result.Success, r);
+            Assert.Null(outs[0]);
+            Assert.Null(outs[1]);
+            Assert.Null(outs[2]);
+            Assert.Equal(2, vk.FreeMemoryCallCount);
+        }
+
+        [Fact]
+        public void AllocateMemoryPages_AllSucceed_FreeMemoryNotCalled()
+        {
+            var (vk, allocator) = MakeAllocator();
+            using var __ = allocator;
+
+            var reqs = new MemoryRequirements[3];
+            var cis  = new VmaAllocationCreateInfo[3];
+            var outs = new VmaAllocation?[3];
+            for (int i = 0; i < 3; i++)
+            {
+                reqs[i] = new MemoryRequirements { Size = 1024, Alignment = 1, MemoryTypeBits = 1u };
+                cis[i]  = new VmaAllocationCreateInfo
+                {
+                    Flags = VmaAllocationCreateFlags.DedicatedMemoryBit,
+                };
+            }
+
+            Result r = allocator.AllocateMemoryPages(reqs, cis, outs);
+
+            Assert.Equal(Result.Success, r);
             Assert.Equal(0, vk.FreeMemoryCallCount);
 
-            _ = callIndex; // unused; kept for documentation
+            allocator.FreeMemoryPages(outs);
+            Assert.Equal(3, vk.FreeMemoryCallCount);
         }
 
         [Fact]

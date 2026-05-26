@@ -112,15 +112,17 @@ namespace CursedVMA.Tests
         }
 
         [Fact]
-        public void CheckCorruption_ReturnsSuccess_WhenMagicIntact()
+        public void CheckCorruption_DedicatedOnly_ReturnsSuccess_TriviallyNoBlocksToScan()
         {
+            // Dedicated allocations bypass block vectors. With debug margin set
+            // but no block-vector allocations, CheckCorruption has no blocks to
+            // scan and returns Success trivially. The block-allocation variant
+            // (CheckCorruption_BlockAlloc_ReturnsSuccess_WhenMagicIntact below)
+            // covers the path where margins are actually written and verified.
             var f  = new Phase19Fixture();
             var a  = Alloc(f);
             var r  = f.Allocator.CheckCorruption(0b1);
 
-            // Dedicated allocations bypass block vectors. The block vector has
-            // margin > 0 but no blocks, so CheckCorruption returns Success
-            // (no blocks to check = no corruption found).
             Assert.Equal(Result.Success, r);
 
             f.Allocator.FreeMemory(a);

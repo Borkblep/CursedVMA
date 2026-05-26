@@ -445,11 +445,14 @@ namespace CursedVMA.Tests
         }
 
         [Fact]
-        public void CreateAliasingBuffer2_BindsWithOffset()
+        public void CreateAliasingBuffer2_NullPNext_BindsViaVkBindBufferMemory()
         {
-            // When pNext is null the implementation falls through to
-            // vkBindBufferMemory (not vkBindBufferMemory2); just verify binding
-            // happened and the call succeeded.
+            // CreateAliasingBuffer2 always passes pNext=null to its underlying
+            // BindBufferMemory2 helper, which falls through to vkBindBufferMemory
+            // (not the vkBindBufferMemory2 variant). Direct callers can reach
+            // the vkBindBufferMemory2 path via VmaAllocator.BindBufferMemory2
+            // with a non-null pNext; that path is covered by the existing
+            // BindBufferMemory2_WithPNext tests.
             var f   = MakeFixture();
             var req = new MemoryRequirements { Size = 1024, Alignment = 1, MemoryTypeBits = 1 };
             var ci  = new VmaAllocationCreateInfo { Flags = VmaAllocationCreateFlags.DedicatedMemoryBit };
@@ -468,11 +471,11 @@ namespace CursedVMA.Tests
         }
 
         [Fact]
-        public void CreateAliasingImage2_BindsWithOffset()
+        public void CreateAliasingImage2_NullPNext_BindsViaVkBindImageMemory()
         {
-            // When pNext is null the implementation falls through to
-            // vkBindImageMemory (not vkBindImageMemory2); just verify binding
-            // happened and the call succeeded.
+            // Same as the buffer variant above: CreateAliasingImage2 passes
+            // pNext=null, so vkBindImageMemory (1-variant) is used. The
+            // vkBindImageMemory2 path is covered by BindImageMemory2_WithPNext.
             var f   = MakeFixture();
             var req = new MemoryRequirements { Size = 1024, Alignment = 1, MemoryTypeBits = 1 };
             var ci  = new VmaAllocationCreateInfo { Flags = VmaAllocationCreateFlags.DedicatedMemoryBit };
